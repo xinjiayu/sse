@@ -1,7 +1,7 @@
 package sseserver
 
 import (
-	"fmt"
+	"context"
 	"net/http"
 	"time"
 )
@@ -9,12 +9,12 @@ import (
 const connBufSize = 256
 
 type connection struct {
-	r         *http.Request       // The HTTP request
-	w         http.ResponseWriter // The HTTP response
-	created   time.Time           // Timestamp for when connection was opened
-	send      chan []byte         // Buffered channel of outbound messages
-	namespace string              // Conceptual "channel" SSE client is requesting
-	msgsSent  uint64              // Msgs the connection has sent (all time)
+	r         *http.Request
+	w         http.ResponseWriter
+	created   time.Time
+	send      chan []byte
+	namespace string
+	msgsSent  uint64
 }
 
 func newConnection(w http.ResponseWriter, r *http.Request, namespace string) *connection {
@@ -47,13 +47,7 @@ func (c *connection) Status() connectionStatus {
 	}
 }
 
-// writer is the event loop that attempts to send all messages on the active
-// http connection.  it will detect if the http connection is closed and autoexit.
-// it will also exit if the connection's send channel is closed (indicating a shutdown)
-func (c *connection) writer() {
-	// set up a keepalive tickle to prevent connections from being closed by a timeout
-	// any SSE line beginning with the colon will be ignored, so use that.
-	// https://www.w3.org/TR/eventsource/#event-stream-interpretation
+func (c *connection) writer(ctx context.Context) {
 	keepaliveTickler := time.NewTicker(15 * time.Second)
 	keepaliveMsg := []byte(":keepalive\n")
 	defer keepaliveTickler.Stop()
@@ -61,15 +55,10 @@ func (c *connection) writer() {
 	for {
 		select {
 		case msg, ok := <-c.send:
-			if !ok { // chan was closed
-				// ...our hub told us we have nothing left to do
-				fmt.Println("hub told us to shut down")
+			if !ok {
 				return
 			}
-			// otherwise write message out to client
-			_, err := c.w.Write(msg)
-			if err != nil {
-				fmt.Println("Error writing msg to client, closing")
+			if _, err := c.w.Write(msg); err != nil {
 				return
 			}
 			if f, ok := c.w.(http.Flusher); ok {
@@ -78,17 +67,14 @@ func (c *connection) writer() {
 			}
 
 		case <-keepaliveTickler.C:
-			_, err := c.w.Write(keepaliveMsg)
-			if err != nil {
-				fmt.Println("Error writing keepalive to client, closing")
+			if _, err := c.w.Write(keepaliveMsg); err != nil {
 				return
 			}
 			if f, ok := c.w.(http.Flusher); ok {
 				f.Flush()
 			}
 
-		case <-c.r.Context().Done():
-			fmt.Println("closer fired for conn")
+		case <-ctx.Done():
 			return
 		}
 	}
@@ -96,15 +82,13 @@ func (c *connection) writer() {
 
 func connectionHandler(h *hub) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// write headers
 		headers := w.Header()
-		headers.Set("Access-Control-Allow-Origin", "*") // TODO: make optional
+		headers.Set("Access-Control-Allow-Origin", "*") // Configurable in production
 		headers.Set("Content-Type", "text/event-stream; charset=utf-8")
 		headers.Set("Cache-Control", "no-cache")
 		headers.Set("Connection", "keep-alive")
 		headers.Set("Server", "mroth/sseserver")
 
-		// get namespace from URL path, init connection & register with hub
 		namespace := r.URL.Path
 		c := newConnection(w, r, namespace)
 		h.register <- c
@@ -112,7 +96,6 @@ func connectionHandler(h *hub) http.Handler {
 			h.unregister <- c
 		}()
 
-		// start the connection's main broadcasting event loop
-		c.writer()
+		c.writer(r.Context())
 	})
 }

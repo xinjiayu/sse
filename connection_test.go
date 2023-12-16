@@ -84,7 +84,7 @@ func TestConnectionSend(t *testing.T) {
 		close(c.send)
 	}()
 
-	c.writer() // blocks until send is closed
+	c.writer(context.Background()) // blocks until send is closed
 	var expected = append(payload, payload...)
 	if actual := rr.Body.Bytes(); !bytes.Equal(actual, expected) {
 		t.Errorf("body does not match:\n[got]\n%s[expected]\n%s",

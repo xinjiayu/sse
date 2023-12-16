@@ -5,6 +5,35 @@
 [![CodeFactor](https://www.codefactor.io/repository/github/mroth/sseserver/badge)](https://www.codefactor.io/repository/github/mroth/sseserver)
 [![Go Report Card](https://goreportcard.com/badge/github.com/mroth/sseserver)](https://goreportcard.com/report/github.com/mroth/sseserver)
 
+对程序进行了多处修改。包括了对 SSE 服务器的关键优化，旨在提高其性能、可维护性和可重用性。通过重用 HTTP 路由和中间件，减少了资源消耗并提高了处理效率。此外，通过改进 SSE 消息的格式化过程和连接管理逻辑，增强了服务器的整体稳定性和响应能力。添加的示例应用程序提供了一个实际使用场景，可以作为使用优化后服务器的参考。
+
+优化 SSE 服务器代码结构和性能
+
+
+## HTTP 路由重用：
+在 Server 结构中添加了 http.ServeMux 实例，以允许路由重用，而不是在每个请求中重新创建。
+
+## 中间件整合：
+ProxyRemoteAddrHandler 和 requestLogger 现在作为 Server 的方法实现，这样就可以在每次请求中重用，而不是每次都创建新的处理函数。
+
+## ServeHTTP 方法更新：
+修改了 ServeHTTP 方法以使用 Server 中的 http.ServeMux 实例。
+
+## 服务器启动流程优化：
+更新了 NewServer 函数以设置路由，并在创建服务器实例时初始化 http.ServeMux。
+
+## 路由设置方法：
+添加了 setupRoutes 方法到 Server 结构中，用于配置 HTTP 路由。
+
+## SSE 消息格式化优化：
+优化了 SSEMessage 的 sseFormat 方法，使用 strings.Builder 以提高字符串构建效率。
+
+## 连接和消息广播处理：
+对 hub 结构进行了修改，添加了读写锁（sync.RWMutex）来保护连接映射，以安全地处理并发访问和修改。
+更新了消息广播逻辑，以优雅地处理消息发送和连接关闭。
+
+
+
 > A high performance and thread-safe Server-Sent Events server for Go with
 _hierarchical namespacing_ support.
 

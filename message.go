@@ -1,29 +1,31 @@
 package sseserver
 
-// SSEMessage is a message suitable for sending over a Server-Sent Event stream.
-//
-// Note: Namespace is not part of the SSE spec, it is merely used internally to
-// map a message to the appropriate HTTP virtual endpoint.
-//
+import (
+	"strings"
+)
+
 type SSEMessage struct {
-	Event     string // event scope for the message [optional]
-	Data      []byte // message payload
-	Namespace string // namespace for msg, matches to client subscriptions
+	Event     string
+	Data      []byte
+	Namespace string
 }
 
-// sseFormat is the formatted bytestring for a SSE message, ready to be sent.
 func (msg SSEMessage) sseFormat() []byte {
-	// var b []byte but add initial capacity of length of keys, fields, and linebreaks.
-	// will be +1 byte wasted capacity if in nonevented case, does that really matter?
-	// cost of the comparison branch before allocation may outweight the 1 byte saving.
-	b := make([]byte, 0, 6+5+len(msg.Event)+len(msg.Data)+3)
+	var sb strings.Builder
+
+	// 预估所需容量：event字段和data字段的长度加上固定的其他字符长度
+	estimatedCapacity := len(msg.Event) + len(msg.Data) + 20 // 20 是额外字符的大概长度
+	sb.Grow(estimatedCapacity)
+
 	if msg.Event != "" {
-		b = append(b, "event:"...)
-		b = append(b, msg.Event...)
-		b = append(b, '\n')
+		sb.WriteString("event:")
+		sb.WriteString(msg.Event)
+		sb.WriteRune('\n')
 	}
-	b = append(b, "data:"...)
-	b = append(b, msg.Data...)
-	b = append(b, '\n', '\n')
-	return b
+
+	sb.WriteString("data:")
+	sb.Write(msg.Data)
+	sb.WriteString("\n\n")
+
+	return []byte(sb.String())
 }
