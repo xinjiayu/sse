@@ -6,73 +6,91 @@ import (
 	"time"
 )
 
+// hub 负责管理客户端连接、广播消息等功能
 type hub struct {
-	broadcast   chan SSEMessage
-	connections map[*connection]bool
-	register    chan *connection
-	unregister  chan *connection
-	shutdown    chan struct{}
-	sentMsgs    uint64
-	startupTime time.Time
-	connMutex   sync.RWMutex // 新增读写锁
+	broadcast   chan SSEMessage      // 用于广播的通道
+	connections map[*connection]bool // 维护活动连接的集合
+	register    chan *connection     // 注册新的连接
+	unregister  chan *connection     // 取消连接
+	shutdown    chan struct{}        // 关闭信号
+	sentMsgs    uint64               // 统计已发送的消息数量
+	startupTime time.Time            // 服务启动时间
+	connMutex   sync.RWMutex         // 读写锁保护 connections
 }
 
+// newHub 创建并初始化 hub 实例
 func newHub() *hub {
 	return &hub{
-		broadcast:   make(chan SSEMessage),
+		broadcast:   make(chan SSEMessage, 100), // 增加缓冲，防止广播阻塞
 		connections: make(map[*connection]bool),
-		register:    make(chan *connection),
-		unregister:  make(chan *connection),
+		register:    make(chan *connection, 100), // 增加缓冲，防止注册阻塞
+		unregister:  make(chan *connection, 100), // 增加缓冲，防止注销阻塞
 		shutdown:    make(chan struct{}),
 		startupTime: time.Now(),
 		connMutex:   sync.RWMutex{},
 	}
 }
 
+// Shutdown 触发 hub 停止
 func (h *hub) Shutdown() {
-	close(h.shutdown)
+	close(h.shutdown) // 发送关闭信号
 }
 
+// Start 启动 hub 的运行循环
 func (h *hub) Start() {
 	go h.run()
 }
 
+// run 是 hub 的主事件循环，处理注册、注销、消息广播和关闭
 func (h *hub) run() {
 	for {
 		select {
 		case <-h.shutdown:
-			h.connMutex.Lock()
-			for c := range h.connections {
-				h._shutdownConn(c)
-			}
-			h.connections = make(map[*connection]bool) // 重置连接映射
-			h.connMutex.Unlock()
+			h.shutdownConnections()
 			return
 		case c := <-h.register:
-			h.connMutex.Lock()
-			h.connections[c] = true
-			h.connMutex.Unlock()
+			h.addConnection(c)
 		case c := <-h.unregister:
-			h._unregisterConn(c)
+			h.removeConnection(c)
 		case msg := <-h.broadcast:
 			h.sentMsgs++
-			h._broadcastMessage(msg)
+			h.broadcastMessage(msg)
 		}
 	}
 }
 
-func (h *hub) _unregisterConn(c *connection) {
+// shutdownConnections 安全关闭所有连接并清空连接集合
+func (h *hub) shutdownConnections() {
 	h.connMutex.Lock()
+	defer h.connMutex.Unlock()
+	for c := range h.connections {
+		h.shutdownConnection(c)
+	}
+	h.connections = make(map[*connection]bool) // 重置连接映射
+}
+
+// addConnection 安全注册新的连接
+func (h *hub) addConnection(c *connection) {
+	h.connMutex.Lock()
+	defer h.connMutex.Unlock()
+	h.connections[c] = true
+}
+
+// removeConnection 安全移除连接
+func (h *hub) removeConnection(c *connection) {
+	h.connMutex.Lock()
+	defer h.connMutex.Unlock()
 	delete(h.connections, c)
-	h.connMutex.Unlock()
+	close(c.send) // 确保安全关闭发送通道
 }
 
-func (h *hub) _shutdownConn(c *connection) {
-	h._unregisterConn(c)
-	close(c.send)
+// shutdownConnection 安全地注销并关闭连接
+func (h *hub) shutdownConnection(c *connection) {
+	h.removeConnection(c)
 }
 
-func (h *hub) _broadcastMessage(msg SSEMessage) {
+// broadcastMessage 将消息广播到匹配的连接
+func (h *hub) broadcastMessage(msg SSEMessage) {
 	formattedMsg := msg.sseFormat()
 	h.connMutex.RLock()
 	defer h.connMutex.RUnlock()
@@ -80,9 +98,9 @@ func (h *hub) _broadcastMessage(msg SSEMessage) {
 	for c := range h.connections {
 		if strings.HasPrefix(msg.Namespace, c.namespace) {
 			select {
-			case c.send <- formattedMsg:
+			case c.send <- formattedMsg: // 尝试发送消息
 			default:
-				h._shutdownConn(c)
+				h.shutdownConnection(c) // 如果发送通道阻塞，则关闭连接
 			}
 		}
 	}
