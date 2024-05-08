@@ -13,6 +13,7 @@ type connection struct {
 	w         http.ResponseWriter
 	created   time.Time
 	send      chan []byte
+	active    bool // 连接是否活动
 	namespace string
 	msgsSent  uint64
 }

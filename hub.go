@@ -73,6 +73,7 @@ func (h *hub) shutdownConnections() {
 func (h *hub) addConnection(c *connection) {
 	h.connMutex.Lock()
 	defer h.connMutex.Unlock()
+	c.active = true // 设置连接为活动状态
 	h.connections[c] = true
 }
 
@@ -80,6 +81,7 @@ func (h *hub) addConnection(c *connection) {
 func (h *hub) removeConnection(c *connection) {
 	h.connMutex.Lock()
 	defer h.connMutex.Unlock()
+	c.active = false // 设置连接为非活动状态
 	delete(h.connections, c)
 	close(c.send) // 确保安全关闭发送通道
 }
@@ -96,7 +98,7 @@ func (h *hub) broadcastMessage(msg SSEMessage) {
 	defer h.connMutex.RUnlock()
 
 	for c := range h.connections {
-		if strings.HasPrefix(msg.Namespace, c.namespace) {
+		if c.active && strings.HasPrefix(msg.Namespace, c.namespace) { // 检查连接是否活动
 			select {
 			case c.send <- formattedMsg: // 尝试发送消息
 			default:
