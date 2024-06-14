@@ -10,12 +10,12 @@
     es = new EventSource("http://localhost:8082/subscribe/sysenv")
 
     // bind the event listeners
-    es.addEventListener("update", displayLastUnRead);
+    es.addEventListener("env", displayLastUnRead);
 
 
     function displayLastUnRead(event) {
         var breed = event.data;
-        _appendListItem("主机信息："+breed);
+        _appendListItem("环境信息："+breed);
     }
 
     function _appendListItem(msg) {

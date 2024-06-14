@@ -1,102 +1,79 @@
 package sseserver
 
 import (
-	"context"
+	"log"
 	"net/http"
-	"time"
+	"sync"
 )
 
-const connBufSize = 256
-
 type connection struct {
-	r         *http.Request
-	w         http.ResponseWriter
-	created   time.Time
-	send      chan []byte
-	active    bool // 连接是否活动
-	namespace string
-	msgsSent  uint64
+	send   chan []byte
+	hub    *hub
+	closed bool
+	mu     sync.Mutex
 }
 
-func newConnection(w http.ResponseWriter, r *http.Request, namespace string) *connection {
-	return &connection{
-		send:      make(chan []byte, connBufSize),
-		w:         w,
-		r:         r,
-		created:   time.Now(),
-		namespace: namespace,
-	}
-}
+func connectionHandler(hub *hub) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn := hub.pool.Get().(*connection) // 从池中获取连接
+		conn.send = make(chan []byte, 512)   // 增加缓冲区大小
+		conn.hub = hub
+		conn.closed = false
+		hub.register <- conn
+		defer func() {
+			conn.close()
+		}()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
 
-type connectionStatus struct {
-	Path      string `json:"request_path"`
-	Namespace string `json:"namespace"`
-	Created   int64  `json:"created_at"`
-	ClientIP  string `json:"client_ip"`
-	UserAgent string `json:"user_agent"`
-	MsgsSent  uint64 `json:"msgs_sent"`
-}
-
-func (c *connection) Status() connectionStatus {
-	return connectionStatus{
-		Path:      c.r.URL.Path,
-		Namespace: c.namespace,
-		Created:   c.created.Unix(),
-		ClientIP:  c.r.RemoteAddr,
-		UserAgent: c.r.UserAgent(),
-		MsgsSent:  c.msgsSent,
-	}
-}
-
-func (c *connection) writer(ctx context.Context) {
-	keepaliveTickler := time.NewTicker(15 * time.Second)
-	keepaliveMsg := []byte(":keepalive\n")
-	defer keepaliveTickler.Stop()
-
-	for {
-		select {
-		case msg, ok := <-c.send:
-			if !ok {
-				return
-			}
-			if _, err := c.w.Write(msg); err != nil {
-				return
-			}
-			if f, ok := c.w.(http.Flusher); ok {
-				f.Flush()
-				c.msgsSent++
-			}
-
-		case <-keepaliveTickler.C:
-			if _, err := c.w.Write(keepaliveMsg); err != nil {
-				return
-			}
-			if f, ok := c.w.(http.Flusher); ok {
-				f.Flush()
-			}
-
-		case <-ctx.Done():
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "Streaming unsupported!", http.StatusInternalServerError)
 			return
 		}
+
+		// 使用请求的 Context 来处理连接关闭通知
+		notify := r.Context().Done()
+		go func() {
+			<-notify
+			conn.close()
+		}()
+
+		for {
+			select {
+			case message, ok := <-conn.send:
+				if !ok {
+					return
+				}
+				//log.Println("Sending message to connection")
+				_, err := w.Write(message)
+				if err != nil {
+					log.Printf("Error writing message: %v", err)
+					return
+				}
+				flusher.Flush()
+			}
+		}
+	})
+}
+
+func (c *connection) write(msg []byte) {
+	select {
+	case c.send <- msg:
+	default:
+		c.close()
 	}
 }
 
-func connectionHandler(h *hub) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		headers := w.Header()
-		headers.Set("Access-Control-Allow-Origin", "*") // Configurable in production
-		headers.Set("Content-Type", "text/event-stream; charset=utf-8")
-		headers.Set("Cache-Control", "no-cache")
-		headers.Set("Connection", "keep-alive")
-		headers.Set("Server", "mroth/sseserver")
-
-		namespace := r.URL.Path
-		c := newConnection(w, r, namespace)
-		h.register <- c
-		defer func() {
-			h.unregister <- c
-		}()
-
-		c.writer(r.Context())
-	})
+func (c *connection) close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.closed {
+		close(c.send)
+		c.closed = true
+		c.hub.unregister <- c
+		//log.Println("Connection closed")
+	}
 }

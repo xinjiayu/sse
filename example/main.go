@@ -1,31 +1,43 @@
 package main
 
 import (
-	"fmt"
-	"github.com/xinjiayu/sse"
+	"encoding/json"
+	sseserver "github.com/xinjiayu/sse"
+	"log"
+	"runtime"
 	"time"
 )
 
 func main() {
-	// 创建并启动 SSE 服务器
 	server := sseserver.NewServer()
 	go server.Serve(":8082")
 
-	// 定期向所有订阅的客户端发送消息
 	go func() {
 		for {
 			message := sseserver.SSEMessage{
-				Event:     "update",
-				Data:      []byte(fmt.Sprintf("Current time: %s", time.Now().Format(time.RFC1123))),
+				Event:     "env",
+				Data:      getEnv(),
 				Namespace: "/sysenv/update",
 			}
 			server.Broadcast <- message
 
-			time.Sleep(3 * time.Second)
-
+			time.Sleep(1 * time.Second)
 		}
 	}()
 
-	// 阻塞主goroutine，以便服务器可以继续运行
 	select {}
+}
+
+func getEnv() (data []byte) {
+	var gm runtime.MemStats
+	runtime.ReadMemStats(&gm)
+	var tmpData = make(map[string]interface{})
+	tmpData["goVersion"] = runtime.Version()
+	tmpData["goroutine"] = runtime.NumGoroutine()
+	//log.Println("GO运行信息", tmpData)
+	data, err := json.Marshal(tmpData)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return data
 }

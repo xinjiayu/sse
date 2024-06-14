@@ -8,9 +8,11 @@ import (
 // Server is the primary interface to a SSE server.
 type Server struct {
 	Broadcast chan<- SSEMessage
+	Receive   chan SSEMessage
 	Options   ServerOptions
 	hub       *hub
 	mux       *http.ServeMux
+	stopChan  chan struct{}
 }
 
 // ServerOptions defines a set of high-level user options that can be customized
@@ -23,11 +25,13 @@ type ServerOptions struct {
 // NewServer creates a new Server and returns a reference to it.
 func NewServer() *Server {
 	s := &Server{
-		hub: newHub(),
-		mux: http.NewServeMux(),
+		hub:      newHub(),
+		mux:      http.NewServeMux(),
+		stopChan: make(chan struct{}),
+		Receive:  make(chan SSEMessage),
 	}
 	// start up our actual internal connection hub
-	s.hub.Start()
+	s.hub.Start(s.startBroadcast, s.stopBroadcast)
 	// then re-export just the hub's broadcast chan to public
 	s.Broadcast = s.hub.broadcast
 	// setup routes
@@ -64,19 +68,36 @@ func (s *Server) proxyRemoteAddrHandler(next http.Handler) http.Handler {
 		ip := r.Header.Get("X-Real-IP")
 		if ip == "" {
 			ip = r.Header.Get("X-Forwarded-For")
+			if ip == "" {
+				ip = r.RemoteAddr
+			}
 		}
-		if ip != "" {
-			r.RemoteAddr = ip
-		}
+		r.RemoteAddr = ip
 		next.ServeHTTP(w, r)
 	})
 }
 
-// requestLogger is a sample of integrating logging via HTTP middleware.
 func (s *Server) requestLogger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Println("CONNECT\t", r.URL.Path, "\t", r.RemoteAddr)
+		log.Printf("%s %s %s\n", r.RemoteAddr, r.Method, r.URL)
 		next.ServeHTTP(w, r)
-		log.Println("DISCONNECT\t", r.URL.Path, "\t", r.RemoteAddr)
 	})
+}
+
+func (s *Server) startBroadcast() {
+	go func() {
+		for {
+			select {
+			case <-s.stopChan:
+				return
+			case message := <-s.Receive:
+				s.Broadcast <- message
+			}
+		}
+	}()
+}
+
+func (s *Server) stopBroadcast() {
+	close(s.stopChan)
+	s.stopChan = make(chan struct{})
 }
