@@ -10,6 +10,7 @@ import (
 
 func main() {
 	server := sseserver.NewServer()
+	server.Debug = true
 	go server.Serve(":8082")
 
 	go func() {

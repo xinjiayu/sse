@@ -47,13 +47,19 @@ func connectionHandler(hub *hub) http.Handler {
 				if !ok {
 					return
 				}
-				//log.Println("Sending message to connection")
+				if *hub.debug {
+					log.Printf("Sending message to connection")
+				}
 				_, err := w.Write(message)
 				if err != nil {
-					log.Printf("Error writing message: %v", err)
+					if *hub.debug {
+						log.Printf("Error writing message: %v", err)
+					}
 					return
 				}
 				flusher.Flush()
+			case <-hub.stopChan:
+				return
 			}
 		}
 	})
@@ -74,6 +80,8 @@ func (c *connection) close() {
 		close(c.send)
 		c.closed = true
 		c.hub.unregister <- c
-		//log.Println("Connection closed")
+		if *c.hub.debug {
+			log.Println("Connection closed")
+		}
 	}
 }

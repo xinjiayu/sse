@@ -1,6 +1,7 @@
 package sseserver
 
 import (
+	"log"
 	"sync"
 )
 
@@ -12,6 +13,8 @@ type hub struct {
 	mu          sync.Mutex
 	activeCount int
 	pool        *sync.Pool
+	stopChan    chan struct{}
+	debug       *bool // 添加 debug 字段
 }
 
 func newHub() *hub {
@@ -25,10 +28,12 @@ func newHub() *hub {
 				return &connection{}
 			},
 		},
+		stopChan: make(chan struct{}),
 	}
 }
 
-func (h *hub) Start(startBroadcast func(), stopBroadcast func()) {
+func (h *hub) Start(startBroadcast func(), stopBroadcast func(), debug *bool) {
+	h.debug = debug
 	go func() {
 		for {
 			select {
@@ -36,7 +41,9 @@ func (h *hub) Start(startBroadcast func(), stopBroadcast func()) {
 				h.mu.Lock()
 				h.connections[conn] = true
 				h.activeCount++
-				//log.Printf("Connection registered, active connections: %d\n", h.activeCount)
+				if *h.debug {
+					log.Printf("Connection registered, active connections: %d\n", h.activeCount)
+				}
 				if h.activeCount == 1 {
 					startBroadcast() // 开始推流
 				}
@@ -48,7 +55,9 @@ func (h *hub) Start(startBroadcast func(), stopBroadcast func()) {
 					conn.close()
 					h.activeCount--
 					h.pool.Put(conn) // 将连接放回池中
-					//log.Printf("Connection unregistered, active connections: %d\n", h.activeCount)
+					if *h.debug {
+						log.Printf("Connection unregistered, active connections: %d\n", h.activeCount)
+					}
 					if h.activeCount == 0 {
 						stopBroadcast() // 停止推流
 					}
@@ -61,13 +70,17 @@ func (h *hub) Start(startBroadcast func(), stopBroadcast func()) {
 					go func() {
 						select {
 						case conn.send <- message.Bytes():
+						case <-h.stopChan:
+							return
 						default:
 							conn.close()
 							h.mu.Lock()
 							delete(h.connections, conn)
 							h.activeCount--
 							h.pool.Put(conn) // 将连接放回池中
-							//log.Printf("Connection closed due to send buffer full, active connections: %d\n", h.activeCount)
+							if *h.debug {
+								log.Printf("Connection closed due to send buffer full, active connections: %d\n", h.activeCount)
+							}
 							if h.activeCount == 0 {
 								stopBroadcast() // 停止推流
 							}
@@ -76,7 +89,23 @@ func (h *hub) Start(startBroadcast func(), stopBroadcast func()) {
 					}()
 				}
 				h.mu.Unlock()
+			case <-h.stopChan:
+				// 清理资源并退出
+				h.mu.Lock()
+				for conn := range h.connections {
+					conn.close()
+					h.pool.Put(conn)
+				}
+				h.connections = make(map[*connection]bool)
+				h.activeCount = 0
+				stopBroadcast()
+				h.mu.Unlock()
+				return
 			}
 		}
 	}()
+}
+
+func (h *hub) Stop() {
+	close(h.stopChan)
 }

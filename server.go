@@ -13,6 +13,8 @@ type Server struct {
 	hub       *hub
 	mux       *http.ServeMux
 	stopChan  chan struct{}
+	debug     bool
+	Debug     bool
 }
 
 // ServerOptions defines a set of high-level user options that can be customized
@@ -29,9 +31,10 @@ func NewServer() *Server {
 		mux:      http.NewServeMux(),
 		stopChan: make(chan struct{}),
 		Receive:  make(chan SSEMessage),
+		Debug:    false, // 默认不启用日志
 	}
 	// start up our actual internal connection hub
-	s.hub.Start(s.startBroadcast, s.stopBroadcast)
+	s.hub.Start(s.startBroadcast, s.stopBroadcast, &s.Debug)
 	// then re-export just the hub's broadcast chan to public
 	s.Broadcast = s.hub.broadcast
 	// setup routes
