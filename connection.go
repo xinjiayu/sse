@@ -48,7 +48,7 @@ func connectionHandler(hub *hub) http.Handler {
 					return
 				}
 				if *hub.debug {
-					log.Printf("Sending message to connection")
+					log.Printf("Sending message to connection：\n%+v", string(message))
 				}
 				_, err := w.Write(message)
 				if err != nil {
@@ -68,6 +68,8 @@ func connectionHandler(hub *hub) http.Handler {
 func (c *connection) write(msg []byte) {
 	select {
 	case c.send <- msg:
+	case <-c.hub.stopChan:
+		return
 	default:
 		c.close()
 	}

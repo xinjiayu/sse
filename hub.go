@@ -108,4 +108,10 @@ func (h *hub) Start(startBroadcast func(), stopBroadcast func(), debug *bool) {
 
 func (h *hub) Stop() {
 	close(h.stopChan)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	close(h.broadcast)
+	for conn := range h.connections {
+		close(conn.send)
+	}
 }
