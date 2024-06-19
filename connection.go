@@ -1,16 +1,16 @@
 package sseserver
 
 import (
+	"context"
 	"log"
 	"net/http"
-	"sync"
+	"time"
 )
 
 type connection struct {
 	send   chan []byte
 	hub    *hub
 	closed bool
-	mu     sync.Mutex
 }
 
 func connectionHandler(hub *hub) http.Handler {
@@ -34,10 +34,11 @@ func connectionHandler(hub *hub) http.Handler {
 			return
 		}
 
-		// 使用请求的 Context 来处理连接关闭通知
-		notify := r.Context().Done()
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel() // 确保协程被正确取消
+
 		go func() {
-			<-notify
+			<-ctx.Done()
 			conn.close()
 		}()
 
@@ -48,7 +49,7 @@ func connectionHandler(hub *hub) http.Handler {
 					return
 				}
 				if *hub.debug {
-					log.Printf("Sending message to connection：\n%+v", string(message))
+					log.Printf("Sending message to connection：\\n%+v", string(message))
 				}
 				_, err := w.Write(message)
 				if err != nil {
@@ -66,18 +67,20 @@ func connectionHandler(hub *hub) http.Handler {
 }
 
 func (c *connection) write(msg []byte) {
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel() // 使用context来管理通道操作的超时
+
 	select {
-	case c.send <- msg:
 	case <-c.hub.stopChan:
 		return
-	default:
+	case c.send <- msg:
+	case <-ctx.Done(): // 处理超时
+		log.Println("Failed to send message: Write timeout")
 		c.close()
 	}
 }
 
 func (c *connection) close() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	if !c.closed {
 		close(c.send)
 		c.closed = true
