@@ -80,16 +80,13 @@ func connectionHandler(hub *hub) http.Handler {
 }
 
 func (c *connection) write(msg []byte) {
-	ctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
-	defer cancel()
-
-	c.mu.Lock()
-	closed := c.closed
-	c.mu.Unlock()
-
-	if closed {
+	if c == nil || c.hub == nil {
+		log.Println("Warning: Attempted to write to a nil connection or hub")
 		return
 	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
+	defer cancel()
 
 	select {
 	case <-c.hub.stopChan:

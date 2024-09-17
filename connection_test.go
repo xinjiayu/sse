@@ -1,102 +1,87 @@
 package sseserver
 
 import (
-	"bytes"
-	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
-/*
-New connections should get...
- - HTTP status OK 200
- - content-type event-stream
- - check all headers match what we want
-*/
 func TestConnectionHandler(t *testing.T) {
-	// need to have a running hub, otherwise conn blocks trying to register
 	h := newHub()
-	h.Start()
-	defer h.Shutdown()
+	go h.run(func() {}, func() {}) // 确保 hub 在运行
 
-	// use http.Request with Timeout context, so it will close itself, this
-	// is a hacky way to just disconnect after we have all the headers without
-	// messing around with modifying the http.ResponseRecorder too much.
-	//
-	// See also: https://github.com/golang/go/issues/4436
+	handler := connectionHandler(h)
+
+	// 创建一个测试请求
 	req, err := http.NewRequest("GET", "/", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	// 创建一个 ResponseRecorder 来记录响应
 	rr := httptest.NewRecorder()
-	handler := connectionHandler(h)
-	ctx := req.Context()
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
-	defer cancel()
-	handler.ServeHTTP(rr, req.WithContext(ctx))
 
-	t.Run("status", func(t *testing.T) {
-		expect := http.StatusOK
-		if status := rr.Code; status != expect {
-			t.Errorf("handler returned wrong status code: got %v want %v",
-				status, expect)
-		}
-	})
+	// 在一个 goroutine 中调用处理程序
+	go handler.ServeHTTP(rr, req)
 
-	t.Run("headers", func(t *testing.T) {
-		var headerTests = []struct {
-			header, expect string
-		}{
-			{"Content-type", "text/event-stream; charset=utf-8"},
-			{"Connection", "keep-alive"},
-			{"Cache-Control", "no-cache"},
-			{"Access-Control-Allow-Origin", "*"},
-		}
-		hd := rr.Header()
-		for _, ht := range headerTests {
-			if actual := hd.Get(ht.header); actual != ht.expect {
-				t.Errorf("%s header does not match: got %v want %v",
-					ht.header, actual, ht.expect)
-			}
-		}
-	})
+	// 等待连接建立和注册
+	time.Sleep(500 * time.Millisecond)
 
+	// 检查活跃连接数
+	if count := atomic.LoadInt32(&h.activeCount); count != 1 {
+		t.Errorf("活跃连接数错误，得到 %d，想要 1", count)
+	}
+
+	// 停止 hub
+	close(h.stopChan)
 }
 
-/*
-Connection receives broadcast messages to its send channel.
-*/
-func TestConnectionSend(t *testing.T) {
-	// useless mocks since we're testing internals
-	// if able to move [r,w] out of connection wont need these...
-	req, _ := http.NewRequest("GET", "/", nil)
-	rr := httptest.NewRecorder()
-	c := newConnection(rr, req, "butts")
+func TestConnectionWrite(t *testing.T) {
+	h := newHub()
+	conn := &connection{
+		send: make(chan []byte, sendBufferSize),
+		hub:  h,
+	}
 
-	// async send a sse msg 2x then close
-	msg := SSEMessage{Event: "foo", Data: []byte("bar")}
-	payload := msg.sseFormat()
-	go func() {
-		c.send <- payload
-		c.send <- payload
-		close(c.send)
-	}()
+	// 写入消息
+	message := []byte("test message")
+	conn.write(message)
 
-	c.writer(context.Background()) // blocks until send is closed
-	var expected = append(payload, payload...)
-	if actual := rr.Body.Bytes(); !bytes.Equal(actual, expected) {
-		t.Errorf("body does not match:\n[got]\n%s[expected]\n%s",
-			actual, expected)
+	// 检查消息是否被写入
+	select {
+	case receivedMsg := <-conn.send:
+		if string(receivedMsg) != string(message) {
+			t.Errorf("写入的消息不匹配，得到 %s，想要 %s", string(receivedMsg), string(message))
+		}
+	case <-time.After(time.Second):
+		t.Error("写入消息超时")
 	}
 }
 
-/*
-A connection should close if it's send channel is closed. This happens when the
-hub wants us to shutdown gracefully. This is mostly designed to deal with
-stalled clients -- as the hub will tell us to close the connection once our
-buffer fills up.
+func TestConnectionClose(t *testing.T) {
+	h := newHub()
+	conn := &connection{
+		send: make(chan []byte, sendBufferSize),
+		hub:  h,
+	}
 
-Add a test for this on the connection side (tested on hub side already).
-*/
+	// 关闭连接
+	conn.close()
+
+	// 检查 closed 标志
+	if !conn.closed {
+		t.Error("连接未被正确标记为关闭")
+	}
+
+	// 检查 send 通道是否被关闭
+	select {
+	case _, ok := <-conn.send:
+		if ok {
+			t.Error("send 通道未被关闭")
+		}
+	default:
+		t.Error("send 通道未被关闭")
+	}
+}

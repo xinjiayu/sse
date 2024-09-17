@@ -49,11 +49,11 @@ func (h *hub) run(startBroadcast func(), stopBroadcast func()) {
 		select {
 		case conn := <-h.register:
 			h.connections[conn] = true
-			newCount := atomic.AddInt32(&h.activeCount, 1)
+			atomic.AddInt32(&h.activeCount, 1)
 			if h.debug {
-				log.Printf("Connection registered, active connections: %d\n", newCount)
+				log.Printf("Connection registered, active connections: %d\n", atomic.LoadInt32(&h.activeCount))
 			}
-			if newCount == 1 {
+			if atomic.LoadInt32(&h.activeCount) == 1 {
 				startBroadcast()
 			}
 		case conn := <-h.unregister:
@@ -78,13 +78,12 @@ func (h *hub) run(startBroadcast func(), stopBroadcast func()) {
 
 func (h *hub) broadcastMessage(message SSEMessage) {
 	for conn := range h.connections {
+		if conn == nil || conn.hub == nil {
+			log.Println("Warning: Invalid connection found in hub")
+			continue
+		}
 		go func(c *connection) {
-			select {
-			case <-h.stopChan:
-				return
-			default:
-				c.write(message.Bytes())
-			}
+			c.write(message.Bytes())
 		}(conn)
 	}
 }

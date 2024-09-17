@@ -3,6 +3,8 @@ package sseserver
 import (
 	"log"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -19,16 +21,31 @@ type Server struct {
 
 type ServerOptions struct {
 	DisableAdminEndpoints bool
+	CorsOptions           *CorsOptions
 }
 
-func NewServer() *Server {
+type CorsOptions struct {
+	AllowedOrigins []string
+	AllowedMethods []string
+	AllowedHeaders []string
+	MaxAge         int
+}
+
+func NewServer(options ...ServerOptions) *Server {
+	var opts ServerOptions
+	if len(options) > 0 {
+		opts = options[0]
+	}
+
 	s := &Server{
 		hub:      newHub(),
 		mux:      http.NewServeMux(),
 		stopChan: make(chan struct{}),
 		Receive:  make(chan SSEMessage),
 		Debug:    false,
+		Options:  opts,
 	}
+
 	s.hub.Start(s.startBroadcast, s.stopBroadcast, s.Debug)
 	s.Broadcast = s.hub.broadcast
 	s.setupRoutes()
@@ -38,8 +55,48 @@ func NewServer() *Server {
 func (s *Server) setupRoutes() {
 	s.mux.Handle(
 		"/subscribe/",
-		http.StripPrefix("/subscribe", connectionHandler(s.hub)),
+		http.StripPrefix("/subscribe", s.corsMiddleware(connectionHandler(s.hub))),
 	)
+}
+
+func (s *Server) corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.Options.CorsOptions == nil {
+			// Default CORS settings (allow all origins)
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		} else {
+			origin := r.Header.Get("Origin")
+			if origin != "" {
+				for _, allowedOrigin := range s.Options.CorsOptions.AllowedOrigins {
+					if allowedOrigin == "*" || allowedOrigin == origin {
+						w.Header().Set("Access-Control-Allow-Origin", origin)
+						break
+					}
+				}
+			}
+
+			if len(s.Options.CorsOptions.AllowedMethods) > 0 {
+				w.Header().Set("Access-Control-Allow-Methods", strings.Join(s.Options.CorsOptions.AllowedMethods, ", "))
+			}
+
+			if len(s.Options.CorsOptions.AllowedHeaders) > 0 {
+				w.Header().Set("Access-Control-Allow-Headers", strings.Join(s.Options.CorsOptions.AllowedHeaders, ", "))
+			}
+
+			if s.Options.CorsOptions.MaxAge > 0 {
+				w.Header().Set("Access-Control-Max-Age", strconv.Itoa(s.Options.CorsOptions.MaxAge))
+			}
+		}
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
