@@ -36,7 +36,7 @@ package main
 import (
     "fmt"
     "net/http"
-    "github.com/your-username/sseserver"
+    "github.com/xinjiayu/sse"
 )
 
 func main() {
