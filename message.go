@@ -16,7 +16,7 @@ func (msg SSEMessage) Bytes() []byte {
 	if msg.Event != "" {
 		sb.WriteString("event:")
 		sb.WriteString(msg.Event)
-		sb.WriteRune('\n')
+		sb.WriteString("\n")
 	}
 
 	dataLines := strings.Split(string(msg.Data), "\n")

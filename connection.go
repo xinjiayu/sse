@@ -4,25 +4,36 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"sync"
 	"time"
+)
+
+const (
+	// 增加缓冲区大小，减少阻塞风险
+	sendBufferSize = 1024
+	// 写入超时时间
+	writeTimeout = 5 * time.Second
 )
 
 type connection struct {
 	send   chan []byte
 	hub    *hub
 	closed bool
+	mu     sync.Mutex // 保护 closed 字段
 }
 
 func connectionHandler(hub *hub) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn := hub.pool.Get().(*connection) // 从池中获取连接
-		conn.send = make(chan []byte, 512)   // 增加缓冲区大小
+		conn := hub.pool.Get().(*connection)
+		conn.send = make(chan []byte, sendBufferSize)
 		conn.hub = hub
 		conn.closed = false
 		hub.register <- conn
 		defer func() {
 			conn.close()
+			hub.pool.Put(conn) // 将连接放回池中
 		}()
+
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
@@ -35,7 +46,7 @@ func connectionHandler(hub *hub) http.Handler {
 		}
 
 		ctx, cancel := context.WithCancel(r.Context())
-		defer cancel() // 确保协程被正确取消
+		defer cancel()
 
 		go func() {
 			<-ctx.Done()
@@ -48,12 +59,12 @@ func connectionHandler(hub *hub) http.Handler {
 				if !ok {
 					return
 				}
-				if *hub.debug {
-					log.Printf("Sending message to connection：\\n%+v", string(message))
+				if hub.debug {
+					log.Printf("Sending message to connection：\n%s", string(message))
 				}
 				_, err := w.Write(message)
 				if err != nil {
-					if *hub.debug {
+					if hub.debug {
 						log.Printf("Error writing message: %v", err)
 					}
 					return
@@ -61,31 +72,44 @@ func connectionHandler(hub *hub) http.Handler {
 				flusher.Flush()
 			case <-hub.stopChan:
 				return
+			case <-ctx.Done():
+				return
 			}
 		}
 	})
 }
 
 func (c *connection) write(msg []byte) {
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel() // 使用context来管理通道操作的超时
+	ctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
+	defer cancel()
+
+	c.mu.Lock()
+	closed := c.closed
+	c.mu.Unlock()
+
+	if closed {
+		return
+	}
 
 	select {
 	case <-c.hub.stopChan:
 		return
 	case c.send <- msg:
-	case <-ctx.Done(): // 处理超时
+	case <-ctx.Done():
 		log.Println("Failed to send message: Write timeout")
 		c.close()
 	}
 }
 
 func (c *connection) close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	if !c.closed {
 		close(c.send)
 		c.closed = true
 		c.hub.unregister <- c
-		if *c.hub.debug {
+		if c.hub.debug {
 			log.Println("Connection closed")
 		}
 	}

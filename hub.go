@@ -3,6 +3,7 @@ package sseserver
 import (
 	"log"
 	"sync"
+	"sync/atomic"
 )
 
 type hub struct {
@@ -10,10 +11,10 @@ type hub struct {
 	broadcast   chan SSEMessage
 	register    chan *connection
 	unregister  chan *connection
-	activeCount int
+	activeCount int32 // 使用原子操作
 	pool        *sync.Pool
 	stopChan    chan struct{}
-	debug       *bool // 添加 debug 字段
+	debug       bool
 	closeOnce   sync.Once
 }
 
@@ -32,68 +33,68 @@ func newHub() *hub {
 	}
 }
 
-func (h *hub) Start(startBroadcast func(), stopBroadcast func(), debug *bool) {
+func (h *hub) Start(startBroadcast func(), stopBroadcast func(), debug bool) {
 	h.debug = debug
-	go func() {
-		defer func() {
-			if r := recover(); r != nil && *debug {
-				log.Println("Recovered in Start", r)
-			}
-		}()
+	go h.run(startBroadcast, stopBroadcast)
+}
 
-		for {
-			select {
-			case conn := <-h.register:
-				h.connections[conn] = true
-				h.activeCount++
-				if *h.debug {
-					log.Printf("Connection registered, active connections: %d\n", h.activeCount)
-				}
-				if h.activeCount == 1 {
-					startBroadcast() // 开始推流
-				}
-			case conn := <-h.unregister:
-				if _, ok := h.connections[conn]; ok {
-					delete(h.connections, conn)
-					conn.close()
-					h.activeCount--
-					h.pool.Put(conn) // 将连接放回池中
-					if *h.debug {
-						log.Printf("Connection unregistered, active connections: %d\n", h.activeCount)
-					}
-					if h.activeCount == 0 {
-						stopBroadcast() // 停止推流
-					}
-				}
-			case message := <-h.broadcast:
-				for conn := range h.connections {
-					conn := conn
-					go func(c *connection) {
-						select {
-						case <-h.stopChan:
-							return
-						default:
-							if !c.closed {
-								c.send <- message.Bytes()
-							}
-						}
-					}(conn)
-				}
-			case <-h.stopChan:
-				h.closeConnections()
-				return
-			}
+func (h *hub) run(startBroadcast func(), stopBroadcast func()) {
+	defer func() {
+		if r := recover(); r != nil && h.debug {
+			log.Println("Recovered in hub.run", r)
 		}
 	}()
+
+	for {
+		select {
+		case conn := <-h.register:
+			h.connections[conn] = true
+			newCount := atomic.AddInt32(&h.activeCount, 1)
+			if h.debug {
+				log.Printf("Connection registered, active connections: %d\n", newCount)
+			}
+			if newCount == 1 {
+				startBroadcast()
+			}
+		case conn := <-h.unregister:
+			if _, ok := h.connections[conn]; ok {
+				delete(h.connections, conn)
+				newCount := atomic.AddInt32(&h.activeCount, -1)
+				if h.debug {
+					log.Printf("Connection unregistered, active connections: %d\n", newCount)
+				}
+				if newCount == 0 {
+					stopBroadcast()
+				}
+			}
+		case message := <-h.broadcast:
+			h.broadcastMessage(message)
+		case <-h.stopChan:
+			h.closeConnections()
+			return
+		}
+	}
+}
+
+func (h *hub) broadcastMessage(message SSEMessage) {
+	for conn := range h.connections {
+		go func(c *connection) {
+			select {
+			case <-h.stopChan:
+				return
+			default:
+				c.write(message.Bytes())
+			}
+		}(conn)
+	}
 }
 
 func (h *hub) closeConnections() {
 	for conn := range h.connections {
 		conn.close()
-		h.pool.Put(conn)
 	}
 	h.connections = make(map[*connection]bool)
-	h.activeCount = 0
+	atomic.StoreInt32(&h.activeCount, 0)
 }
 
 func (h *hub) Stop() {
