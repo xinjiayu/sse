@@ -17,7 +17,7 @@ example 下的示例代码
 1. 使用 `go get` 命令安装 SSE 服务器包：
 
    ```
-   go get github.com/your-username/sseserver
+   go get github.com/xinjiayu/sse
    ```
 
 2. 在您的项目中导入 SSE 服务器包：
