@@ -1,6 +1,7 @@
 package sseserver
 
 import (
+	"fmt"
 	"strings"
 )
 
@@ -11,21 +12,37 @@ type SSEMessage struct {
 }
 
 func (msg SSEMessage) Bytes() []byte {
-	var sb strings.Builder
+	var builder strings.Builder
 
 	if msg.Event != "" {
-		sb.WriteString("event:")
-		sb.WriteString(msg.Event)
-		sb.WriteString("\n")
+		builder.WriteString(fmt.Sprintf("event:%s\n", msg.Event))
 	}
 
-	dataLines := strings.Split(string(msg.Data), "\n")
+	if msg.Namespace != "" {
+		builder.WriteString(fmt.Sprintf("namespace:%s\n", msg.Namespace))
+	}
+
+	dataStr := string(msg.Data)
+	dataLines := strings.Split(dataStr, "\n")
 	for _, line := range dataLines {
-		sb.WriteString("data:")
-		sb.WriteString(line)
-		sb.WriteString("\n")
+		builder.WriteString(fmt.Sprintf("data:%s\n", line))
 	}
-	sb.WriteString("\n")
 
-	return []byte(sb.String())
+	builder.WriteString("\n")
+
+	return []byte(builder.String())
+}
+
+// NewSSEMessage 创建一个新的 SSEMessage
+func NewSSEMessage(event string, data []byte, namespace string) SSEMessage {
+	return SSEMessage{
+		Event:     event,
+		Data:      data,
+		Namespace: namespace,
+	}
+}
+
+// IsValid 检查 SSEMessage 是否有效
+func (msg SSEMessage) IsValid() bool {
+	return len(msg.Data) > 0
 }

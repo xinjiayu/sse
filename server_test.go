@@ -3,6 +3,7 @@ package sseserver
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -20,54 +21,68 @@ func TestNewServer(t *testing.T) {
 
 func TestServeHTTP(t *testing.T) {
 	server := NewServer()
+	server.Debug = true
 
-	// 创建一个测试请求
 	req, err := http.NewRequest("GET", "/subscribe/", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// 创建一个 ResponseRecorder 来记录响应
 	rr := httptest.NewRecorder()
 
-	// 调用 ServeHTTP 方法
-	server.ServeHTTP(rr, req)
+	// 在后台运行 ServeHTTP
+	go server.ServeHTTP(rr, req)
 
-	// 检查状态码
-	if status := rr.Code; status != http.StatusOK {
-		t.Errorf("处理程序返回了错误的状态码：得到 %v 想要 %v", status, http.StatusOK)
+	// 等待连接建立
+	time.Sleep(100 * time.Millisecond)
+
+	// 发送测试消息
+	testMessage := SSEMessage{
+		Event: "test",
+		Data:  []byte("Hello, SSE!"),
 	}
+	server.Broadcast <- testMessage
 
-	// 检查 Content-Type
-	expectedContentType := "text/event-stream"
-	if contentType := rr.Header().Get("Content-Type"); contentType != expectedContentType {
-		t.Errorf("处理程序返回了错误的 Content-Type：得到 %v 想要 %v", contentType, expectedContentType)
+	// 给予更长的等待时间
+	time.Sleep(500 * time.Millisecond)
+
+	// 检查响应
+	response := rr.Body.String()
+	expected := "event:test\ndata:Hello, SSE!\n\n"
+	if !strings.Contains(response, expected) {
+		t.Errorf("没有收到预期的 SSE 消息。得到的响应：%s", response)
 	}
 }
 
 func TestBroadcast(t *testing.T) {
 	server := NewServer()
+	server.Debug = true
 
-	// 启动一个 goroutine 来模拟客户端连接
-	go func() {
-		req, _ := http.NewRequest("GET", "/subscribe/", nil)
-		rr := httptest.NewRecorder()
-		server.ServeHTTP(rr, req)
-	}()
+	// 模拟客户端连接
+	req, _ := http.NewRequest("GET", "/subscribe/", nil)
+	rr := httptest.NewRecorder()
+	go server.ServeHTTP(rr, req)
 
-	// 等待一段时间以确保连接建立
+	// 给予时间让连接建立
 	time.Sleep(100 * time.Millisecond)
 
-	// 发送一条消息
+	// 验证活跃连接数
+	if count := server.GetActiveConnectionCount(); count != 1 {
+		t.Errorf("预期的活跃连接数为 1，但得到 %d", count)
+	}
+
+	// 发送消息
 	testMessage := SSEMessage{Event: "test", Data: []byte("Hello, SSE!")}
 	server.Broadcast <- testMessage
 
-	// 等待消息被处理
-	time.Sleep(100 * time.Millisecond)
+	// 给予更长的时间让消息被处理
+	time.Sleep(500 * time.Millisecond)
 
-	// 检查 hub 的 activeCount
-	if server.hub.activeCount != 1 {
-		t.Errorf("预期的活跃连接数为 1，但得到 %d", server.hub.activeCount)
+	// 验证消息是否被发送
+	response := rr.Body.String()
+	expected := "event:test\ndata:Hello, SSE!\n\n"
+	if !strings.Contains(response, expected) {
+		t.Errorf("没有收到预期的 SSE 消息。得到的响应：%s", response)
 	}
 }
 

@@ -89,6 +89,95 @@ SSE 服务器使用默认的 `/subscribe/` 路径处理订阅请求。如需自�
 http.Handle("/custom-sse/", http.StripPrefix("/custom-sse", server))
 ```
 
+### CORS 设置
+
+SSE 服务器支持配置跨源资源共享（CORS）选项，允许您控制哪些域可以访问您的 SSE 端点。以下是如何配置 CORS 的说明：
+
+#### 默认 CORS 设置
+
+默认情况下，SSE 服务器允许来自所有域的请求。如果您不指定 CORS 选项，服务器将使用以下默认设置：
+
+```go
+server := sseserver.NewServer()
+```
+
+这将允许所有域访问您的 SSE 端点。
+
+#### 自定义 CORS 设置
+
+要自定义 CORS 设置，您可以在创建服务器时提供 `CorsOptions`：
+
+```go
+server := sseserver.NewServer(sseserver.ServerOptions{
+    CorsOptions: &sseserver.CorsOptions{
+        AllowedOrigins: []string{"https://example.com", "https://api.example.com"},
+        AllowedMethods: []string{"GET", "OPTIONS"},
+        AllowedHeaders: []string{"Content-Type", "Authorization"},
+        MaxAge:         3600,
+    },
+})
+```
+
+- `AllowedOrigins`: 指定允许访问的域名列表。使用 `*` 允许所有域。
+- `AllowedMethods`: 指定允许的 HTTP 方法。
+- `AllowedHeaders`: 指定允许的 HTTP 头。
+- `MaxAge`: 指定预检请求结果的缓存时间（秒）。
+
+#### 动态 CORS 设置
+
+如果您需要更动态的 CORS 控制，您可以实现自己的 CORS 中间件并将其应用到服务器：
+
+```go
+func customCorsMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        // 实现自定义的 CORS 逻辑
+        origin := r.Header.Get("Origin")
+        if /* 自定义条件 */ {
+            w.Header().Set("Access-Control-Allow-Origin", origin)
+        }
+        // 设置其他 CORS 头...
+        next.ServeHTTP(w, r)
+    })
+}
+
+// 应用自定义中间件
+http.Handle("/subscribe/", customCorsMiddleware(server))
+```
+
+#### CORS 配置示例
+
+1. 允许特定域：
+
+```go
+server := sseserver.NewServer(sseserver.ServerOptions{
+    CorsOptions: &sseserver.CorsOptions{
+        AllowedOrigins: []string{"https://app.example.com"},
+    },
+})
+```
+
+2. 允许多个域：
+
+```go
+server := sseserver.NewServer(sseserver.ServerOptions{
+    CorsOptions: &sseserver.CorsOptions{
+        AllowedOrigins: []string{"https://app1.example.com", "https://app2.example.com"},
+    },
+})
+```
+
+3. 允许所有子域：
+
+```go
+server := sseserver.NewServer(sseserver.ServerOptions{
+    CorsOptions: &sseserver.CorsOptions{
+        AllowedOrigins: []string{"*.example.com"},
+    },
+})
+```
+
+注意：在生产环境中，建议明确指定允许的域，而不是使用通配符（`*`），以增强安全性。
+
 ## 最佳实践
 
 1. **错误处理**：始终检查并处理 `Serve` 方法返回的错误。

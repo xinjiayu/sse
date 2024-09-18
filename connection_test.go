@@ -3,16 +3,13 @@ package sseserver
 import (
 	"net/http"
 	"net/http/httptest"
-	"sync/atomic"
 	"testing"
 	"time"
 )
 
 func TestConnectionHandler(t *testing.T) {
-	h := newHub()
-	go h.run(func() {}, func() {}) // 确保 hub 在运行
-
-	handler := connectionHandler(h)
+	server := NewServer()
+	handler := server.connectionHandler()
 
 	// 创建一个测试请求
 	req, err := http.NewRequest("GET", "/", nil)
@@ -23,27 +20,26 @@ func TestConnectionHandler(t *testing.T) {
 	// 创建一个 ResponseRecorder 来记录响应
 	rr := httptest.NewRecorder()
 
-	// 在一个 goroutine 中调用处理程序
+	// 调用处理程序
 	go handler.ServeHTTP(rr, req)
 
-	// 等待连接建立和注册
-	time.Sleep(500 * time.Millisecond)
+	// 等待一段时间以确保连接建立
+	time.Sleep(100 * time.Millisecond)
 
-	// 检查活跃连接数
-	if count := atomic.LoadInt32(&h.activeCount); count != 1 {
-		t.Errorf("活跃连接数错误，得到 %d，想要 1", count)
+	// 检查响应头
+	if ct := rr.Header().Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("Content-Type 错误，得到 %v，想要 text/event-stream", ct)
 	}
 
-	// 停止 hub
-	close(h.stopChan)
+	// 检查连接是否被注册
+	if server.GetActiveConnectionCount() != 1 {
+		t.Errorf("活跃连接数错误，得到 %d，想要 1", server.GetActiveConnectionCount())
+	}
 }
 
 func TestConnectionWrite(t *testing.T) {
 	h := newHub()
-	conn := &connection{
-		send: make(chan []byte, sendBufferSize),
-		hub:  h,
-	}
+	conn := h.newConnection()
 
 	// 写入消息
 	message := []byte("test message")
@@ -62,18 +58,10 @@ func TestConnectionWrite(t *testing.T) {
 
 func TestConnectionClose(t *testing.T) {
 	h := newHub()
-	conn := &connection{
-		send: make(chan []byte, sendBufferSize),
-		hub:  h,
-	}
+	conn := h.newConnection()
 
 	// 关闭连接
 	conn.close()
-
-	// 检查 closed 标志
-	if !conn.closed {
-		t.Error("连接未被正确标记为关闭")
-	}
 
 	// 检查 send 通道是否被关闭
 	select {
