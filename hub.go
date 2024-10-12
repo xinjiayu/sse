@@ -69,7 +69,9 @@ func (h *hub) run(startBroadcast func(), stopBroadcast func()) {
 
 func (h *hub) registerConnection(conn *connection, startBroadcast func()) {
 	if atomic.LoadInt32(&h.activeCount) >= MaxConnections {
-		log.Println("达到最大连接数限制，拒绝新连接")
+		if h.debug {
+			log.Println("达到最大连接数限制，拒绝新连接")
+		}
 		conn.close()
 		return
 	}
@@ -136,7 +138,9 @@ func (h *hub) periodicLog() {
 	for {
 		select {
 		case <-ticker.C:
-			log.Printf("当前活跃连接数: %d", atomic.LoadInt32(&h.activeCount))
+			if h.debug {
+				log.Printf("当前活跃连接数: %d", atomic.LoadInt32(&h.activeCount))
+			}
 		case <-h.stopChan:
 			return
 		}
