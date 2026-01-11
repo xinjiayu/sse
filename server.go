@@ -23,6 +23,10 @@ type Server struct {
 	Debug     bool
 	closeOnce sync.Once
 	server    *http.Server
+
+	// 内部状态管理
+	broadcastRunning bool       // 标记广播协程是否正在运行
+	broadcastMu      sync.Mutex // 保护 broadcastRunning 的并发访问
 }
 
 type ServerOptions struct {
@@ -141,6 +145,8 @@ func (s *Server) connectionHandler() http.Handler {
 			}
 		}()
 
+		ctx := r.Context()
+
 		// 主循环
 		for {
 			select {
@@ -148,17 +154,43 @@ func (s *Server) connectionHandler() http.Handler {
 				if !ok {
 					return
 				}
+				// 在写入前先检查连接是否已断开
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
 				conn.updateActivity() // 更新最后活动时间
 				if _, err := w.Write(msg); err != nil {
 					s.logError("Error writing to client: %v", err)
 					return
 				}
-				flusher.Flush()
-			case <-r.Context().Done():
+
+				// 在 Flush 前再次检查连接状态，避免向已关闭的连接 Flush 导致段错误
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				// 使用安全的方式调用 Flush，捕获可能的 panic
+				s.safeFlush(flusher)
+			case <-ctx.Done():
 				return
 			}
 		}
 	})
+}
+
+// safeFlush 安全地调用 Flush，捕获可能的 panic 防止段错误导致程序崩溃
+func (s *Server) safeFlush(flusher http.Flusher) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.logError("Recovered from panic in Flush: %v", r)
+		}
+	}()
+	flusher.Flush()
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -207,13 +239,36 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 }
 
 func (s *Server) startBroadcast() {
+	s.broadcastMu.Lock()
+	// 如果广播协程已经在运行，直接返回，避免重复启动导致协程泄漏
+	if s.broadcastRunning {
+		s.broadcastMu.Unlock()
+		return
+	}
+	s.broadcastRunning = true
+	s.broadcastMu.Unlock()
+
 	go func() {
+		defer func() {
+			s.broadcastMu.Lock()
+			s.broadcastRunning = false
+			s.broadcastMu.Unlock()
+		}()
+
 		for {
 			select {
 			case <-s.stopChan:
 				return
-			case message := <-s.Receive:
-				s.Broadcast <- message
+			case message, ok := <-s.Receive:
+				if !ok {
+					return
+				}
+				// 非阻塞发送，避免 Broadcast channel 满时阻塞
+				select {
+				case s.Broadcast <- message:
+				case <-s.stopChan:
+					return
+				}
 			}
 		}
 	}()
@@ -237,30 +292,17 @@ func (s *Server) addHealthCheckEndpoint() {
 	})
 }
 
+// startPeriodicCleanup 已废弃，清理逻辑统一由 hub 管理
+// 保留此方法是为了向下兼容，但不再执行任何操作
 func (s *Server) startPeriodicCleanup() {
-	go func() {
-		ticker := time.NewTicker(5 * time.Minute)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				s.cleanupInactiveConnections()
-			case <-s.stopChan:
-				return
-			}
-		}
-	}()
+	// 清理逻辑已统一由 hub.startCleanupRoutine() 处理
+	// 此方法保留为空实现以保持向下兼容
 }
 
+// cleanupInactiveConnections 已废弃，清理逻辑统一由 hub 管理
+// 保留此方法是为了向下兼容
 func (s *Server) cleanupInactiveConnections() {
-	for conn := range s.hub.connections {
-		if conn.isInactive(inactivityTimeout) {
-			s.hub.unregister <- conn
-			if s.Debug {
-				log.Printf("Inactive connection closed: %v", conn)
-			}
-		}
-	}
+	// 清理逻辑已统一由 hub.cleanupExpiredConnections() 处理
 }
 
 func (s *Server) logError(format string, v ...interface{}) {

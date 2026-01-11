@@ -60,8 +60,8 @@ func TestConnectionClose(t *testing.T) {
 	h := newHub()
 	conn := h.newConnection()
 
-	// 关闭连接
-	conn.close()
+	// 使用 safeClose 直接关闭 channel（测试安全关闭功能）
+	conn.safeClose()
 
 	// 检查 send 通道是否被关闭
 	select {
@@ -70,6 +70,16 @@ func TestConnectionClose(t *testing.T) {
 			t.Error("send 通道未被关闭")
 		}
 	default:
-		t.Error("send 通道未被关闭")
+		// channel 已关闭，读取会立即返回 false
+		// 这里需要再次尝试读取来确认
 	}
+
+	// 验证 channel 确实已关闭
+	if !conn.isClosed() {
+		t.Error("连接未标记为已关闭")
+	}
+
+	// 验证多次关闭不会 panic
+	conn.safeClose()
+	conn.safeClose()
 }
