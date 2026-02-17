@@ -71,8 +71,8 @@ func (c *connection) close() {
 	select {
 	case c.hub.unregister <- c:
 	default:
-		// channel 满时直接关闭，防止阻塞
-		c.safeClose()
+		// channel 满时也要走统一注销路径，避免连接残留在 hub map 中
+		c.hub.unregisterConnection(c, func() {})
 	}
 }
 

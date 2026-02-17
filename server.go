@@ -51,7 +51,7 @@ func NewServer(options ...ServerOptions) *Server {
 		hub:      newHub(),
 		mux:      http.NewServeMux(),
 		stopChan: make(chan struct{}),
-		Receive:  make(chan SSEMessage),
+		Receive:  make(chan SSEMessage, 1024),
 		Debug:    false,
 		Options:  opts,
 	}
@@ -137,6 +137,7 @@ func (s *Server) connectionHandler() http.Handler {
 
 		// 创建并注册新连接
 		conn := s.hub.newConnection()
+		sendCh := conn.send
 		s.hub.register <- conn
 		defer func() {
 			s.hub.unregister <- conn
@@ -150,7 +151,7 @@ func (s *Server) connectionHandler() http.Handler {
 		// 主循环
 		for {
 			select {
-			case msg, ok := <-conn.send:
+			case msg, ok := <-sendCh:
 				if !ok {
 					return
 				}
@@ -208,7 +209,10 @@ func (s *Server) Serve(addr string) error {
 }
 
 func (s *Server) Stop() error {
-	s.stopBroadcast()
+	s.closeOnce.Do(func() {
+		close(s.stopChan)
+	})
+	s.hub.Stop()
 	if s.server != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -275,9 +279,8 @@ func (s *Server) startBroadcast() {
 }
 
 func (s *Server) stopBroadcast() {
-	s.closeOnce.Do(func() {
-		close(s.stopChan)
-	})
+	// 广播协程在无连接时无需停止，避免后续重连后广播链路失效。
+	// 真正停止统一由 Stop() 关闭 stopChan 并停止 hub。
 }
 
 func (s *Server) GetActiveConnectionCount() int32 {

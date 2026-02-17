@@ -209,6 +209,26 @@ A: 当前版本支持向所有连接的客户端广播消息。如需点对点�
 
 如果问题持续，请查阅项目的 GitHub 仓库或联系技术支持。
 
+## 稳定性压测（Soak Test）
+
+项目内置了长时稳定性测试，可用于验证高并发下的长期运行能力（连接收敛、goroutine 收敛、消息吞吐）。
+
+默认跳过，开启方式：
+
+```bash
+SOAK=1 SOAK_DURATION_SEC=1800 SOAK_CLIENTS=200 SOAK_MSG_PER_SEC=300 go test -run TestSoak_LongRun -v ./...
+```
+
+常用参数：
+
+- `SOAK=1`：开启 soak 测试
+- `SOAK_DURATION_SEC`：持续时长（秒），如 `1800` 表示 30 分钟
+- `SOAK_CLIENTS`：并发连接数
+- `SOAK_MSG_PER_SEC`：每秒推送消息数
+- `SOAK_REPORT_SEC`：日志打点间隔（秒）
+
+建议先从小规模参数开始，再逐步放大至目标负载。
+
 ## 其它
 
 如果想将sse服务集成到你已有的HTTP服务中，请参访问 【[SSE服务器与现有 HTTP 服务集成指南](httpdoc.md)】

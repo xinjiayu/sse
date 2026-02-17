@@ -157,9 +157,8 @@ func (h *hub) broadcastMessage(message SSEMessage) {
 		select {
 		case h.unregister <- conn:
 		default:
-			// channel 已满，直接关闭连接防止资源泄漏
-			conn.safeClose()
-			h.putConnection(conn)
+			// 退化路径也要走统一注销逻辑，保持 map/计数/pool 状态一致
+			h.unregisterConnection(conn, func() {})
 		}
 	}
 }
@@ -255,15 +254,8 @@ func (h *hub) cleanupExpiredConnections() {
 			h.slicePool.Put(connsPtr)
 			return
 		default:
-			// channel 已满，直接关闭连接防止资源泄漏
-			h.connMu.Lock()
-			if _, ok := h.connections[conn]; ok {
-				delete(h.connections, conn)
-				conn.safeClose()
-				h.putConnection(conn)
-				atomic.AddInt32(&h.activeCount, -1)
-			}
-			h.connMu.Unlock()
+			// 退化路径走统一注销，避免多路径状态不一致
+			h.unregisterConnection(conn, func() {})
 		}
 	}
 

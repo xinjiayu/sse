@@ -1,6 +1,7 @@
 package sseserver
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -104,5 +105,31 @@ func TestStopServer(t *testing.T) {
 		// 正确：stopChan 被关闭
 	default:
 		t.Error("服务器的 stopChan 未被关闭")
+	}
+}
+
+func TestBroadcastAfterReconnect(t *testing.T) {
+	server := NewServer()
+
+	// 第一个连接，随后主动断开
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	req1, _ := http.NewRequestWithContext(ctx1, "GET", "/subscribe/", nil)
+	rr1 := httptest.NewRecorder()
+	go server.ServeHTTP(rr1, req1)
+	time.Sleep(100 * time.Millisecond)
+	cancel1()
+	time.Sleep(150 * time.Millisecond)
+
+	// 第二个连接建立后，广播应仍可正常工作
+	req2, _ := http.NewRequest("GET", "/subscribe/", nil)
+	rr2 := httptest.NewRecorder()
+	go server.ServeHTTP(rr2, req2)
+	time.Sleep(100 * time.Millisecond)
+
+	server.Broadcast <- SSEMessage{Event: "reconnect", Data: []byte("ok")}
+	time.Sleep(300 * time.Millisecond)
+
+	if got := rr2.Body.String(); !strings.Contains(got, "event:reconnect\ndata:ok\n\n") {
+		t.Fatalf("重连后广播失效，响应: %s", got)
 	}
 }
