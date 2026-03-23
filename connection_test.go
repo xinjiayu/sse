@@ -9,27 +9,25 @@ import (
 
 func TestConnectionHandler(t *testing.T) {
 	server := NewServer()
-	handler := server.connectionHandler()
 
-	// 创建一个测试请求
-	req, err := http.NewRequest("GET", "/", nil)
+	ts := httptest.NewServer(server.connectionHandler())
+	defer ts.Close()
+	defer server.Stop()
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(ts.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	// 创建一个 ResponseRecorder 来记录响应
-	rr := httptest.NewRecorder()
-
-	// 调用处理程序
-	go handler.ServeHTTP(rr, req)
-
-	// 等待一段时间以确保连接建立
-	time.Sleep(100 * time.Millisecond)
+	defer resp.Body.Close()
 
 	// 检查响应头
-	if ct := rr.Header().Get("Content-Type"); ct != "text/event-stream" {
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
 		t.Errorf("Content-Type 错误，得到 %v，想要 text/event-stream", ct)
 	}
+
+	// 等待连接注册
+	time.Sleep(100 * time.Millisecond)
 
 	// 检查连接是否被注册
 	if server.GetActiveConnectionCount() != 1 {

@@ -8,37 +8,43 @@ import (
 )
 
 const (
-	MaxConnections = 10000
+	MaxConnections          = 10000
+	defaultBroadcastWorkers = 4
 )
 
 type hub struct {
-	connections map[*connection]bool
-	broadcast   chan SSEMessage
-	register    chan *connection
-	unregister  chan *connection
-	stopChan    chan struct{}
-	debug       bool
-	activeCount int32
-	pool        *sync.Pool
-	closeOnce   sync.Once
-	connMu      sync.RWMutex // 保护 connections map 的读写操作
-	slicePool   *sync.Pool   // 复用连接切片，减少 GC 压力
+	connections      map[*connection]bool
+	broadcast        chan SSEMessage
+	broadcastQueue   chan SSEMessage // 异步广播队列，worker 从此消费
+	register         chan *connection
+	unregister       chan *connection
+	stopChan         chan struct{}
+	debug            bool
+	activeCount      int32
+	broadcastWorkers int
+	pool             *sync.Pool
+	closeOnce        sync.Once
+	connMu           sync.RWMutex // 保护 connections map 的读写操作
+	slicePool        *sync.Pool   // 复用连接切片，减少 GC 压力
+	stopBroadcastFn  func()       // 存储 stopBroadcast 回调，供退化路径使用
 }
 
 func newHub() *hub {
 	return &hub{
-		connections: make(map[*connection]bool),
-		broadcast:   make(chan SSEMessage, 1024),
-		register:    make(chan *connection, 1024),
-		unregister:  make(chan *connection, 1024),
-		stopChan:    make(chan struct{}),
+		connections:      make(map[*connection]bool),
+		broadcast:        make(chan SSEMessage, 1024),
+		broadcastQueue:   make(chan SSEMessage, 2048),
+		register:         make(chan *connection, 1024),
+		unregister:       make(chan *connection, 1024),
+		stopChan:         make(chan struct{}),
+		broadcastWorkers: defaultBroadcastWorkers,
 		pool: &sync.Pool{
-			New: func() interface{} {
+			New: func() any {
 				return &connection{}
 			},
 		},
 		slicePool: &sync.Pool{
-			New: func() interface{} {
+			New: func() any {
 				// 预分配一个合理大小的切片
 				s := make([]*connection, 0, 128)
 				return &s
@@ -49,14 +55,18 @@ func newHub() *hub {
 
 func (h *hub) Start(startBroadcast func(), stopBroadcast func(), debug bool) {
 	h.debug = debug
+	h.stopBroadcastFn = stopBroadcast
 	go h.run(startBroadcast, stopBroadcast)
+	for i := 0; i < h.broadcastWorkers; i++ {
+		go h.broadcastWorker()
+	}
 	go h.periodicLog()
 	h.startCleanupRoutine()
 }
 
 func (h *hub) run(startBroadcast func(), stopBroadcast func()) {
 	defer func() {
-		if r := recover(); r != nil && h.debug {
+		if r := recover(); r != nil {
 			log.Println("Recovered in hub.run", r)
 		}
 	}()
@@ -68,9 +78,31 @@ func (h *hub) run(startBroadcast func(), stopBroadcast func()) {
 		case conn := <-h.unregister:
 			h.unregisterConnection(conn, stopBroadcast)
 		case message := <-h.broadcast:
-			h.broadcastMessage(message)
+			// 非阻塞投递到广播队列，由 worker 异步执行，避免阻塞事件循环
+			select {
+			case h.broadcastQueue <- message:
+			default:
+				if h.debug {
+					log.Println("broadcast queue full, message dropped")
+				}
+			}
 		case <-h.stopChan:
 			h.closeAllConnections()
+			return
+		}
+	}
+}
+
+// broadcastWorker 从广播队列消费消息并分发给所有连接
+func (h *hub) broadcastWorker() {
+	for {
+		select {
+		case msg, ok := <-h.broadcastQueue:
+			if !ok {
+				return
+			}
+			h.broadcastMessage(msg)
+		case <-h.stopChan:
 			return
 		}
 	}
@@ -138,9 +170,11 @@ func (h *hub) broadcastMessage(message SSEMessage) {
 	// 发送消息给所有连接
 	var failedConns []*connection
 	for _, conn := range conns {
-		select {
-		case conn.send <- data:
-		default:
+		// 跳过已关闭的连接，避免向 unregister channel 发送重复请求
+		if conn.isClosed() {
+			continue
+		}
+		if !conn.trySend(data) {
 			failedConns = append(failedConns, conn)
 		}
 	}
@@ -158,7 +192,7 @@ func (h *hub) broadcastMessage(message SSEMessage) {
 		case h.unregister <- conn:
 		default:
 			// 退化路径也要走统一注销逻辑，保持 map/计数/pool 状态一致
-			h.unregisterConnection(conn, func() {})
+			h.unregisterConnection(conn, h.stopBroadcastFn)
 		}
 	}
 }
@@ -175,7 +209,7 @@ func (h *hub) closeAllConnections() {
 	h.connMu.Unlock()
 
 	for _, conn := range conns {
-		h.unregisterConnection(conn, func() {})
+		h.unregisterConnection(conn, h.stopBroadcastFn)
 	}
 
 	// 清理并归还切片到 pool
@@ -207,8 +241,9 @@ func (h *hub) newConnection() *connection {
 // putConnection 将连接归还到 pool 以便复用，减少 GC 压力
 func (h *hub) putConnection(conn *connection) {
 	// 清理连接引用，帮助 GC
+	// 注意：不 nil conn.send，因为广播 worker 可能仍在并发访问
+	// send channel 已被 safeClose 关闭，newConnection 会创建新的
 	conn.hub = nil
-	conn.send = nil
 	h.pool.Put(conn)
 }
 
@@ -255,7 +290,7 @@ func (h *hub) cleanupExpiredConnections() {
 			return
 		default:
 			// 退化路径走统一注销，避免多路径状态不一致
-			h.unregisterConnection(conn, func() {})
+			h.unregisterConnection(conn, h.stopBroadcastFn)
 		}
 	}
 

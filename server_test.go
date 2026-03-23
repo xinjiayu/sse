@@ -1,6 +1,7 @@
 package sseserver
 
 import (
+	"bufio"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -10,7 +11,6 @@ import (
 )
 
 func TestNewServer(t *testing.T) {
-	// 测试创建新服务器
 	server := NewServer()
 	if server == nil {
 		t.Fatal("NewServer() 返回了 nil")
@@ -20,38 +20,64 @@ func TestNewServer(t *testing.T) {
 	}
 }
 
+func TestConnectionHandler_Headers(t *testing.T) {
+	server := NewServer()
+
+	ts := httptest.NewServer(server.connectionHandler())
+	defer ts.Close()
+	defer server.Stop()
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("Content-Type 错误，得到 %v，想要 text/event-stream", ct)
+	}
+}
+
 func TestServeHTTP(t *testing.T) {
 	server := NewServer()
 	server.Debug = true
 
-	req, err := http.NewRequest("GET", "/subscribe/", nil)
+	ts := httptest.NewServer(http.HandlerFunc(server.ServeHTTP))
+	defer ts.Close()
+	defer server.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"/subscribe/", nil)
+	client := &http.Client{}
+	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	rr := httptest.NewRecorder()
-
-	// 在后台运行 ServeHTTP
-	go server.ServeHTTP(rr, req)
+	defer resp.Body.Close()
 
 	// 等待连接建立
 	time.Sleep(100 * time.Millisecond)
 
 	// 发送测试消息
-	testMessage := SSEMessage{
-		Event: "test",
-		Data:  []byte("Hello, SSE!"),
+	server.Broadcast <- SSEMessage{Event: "test", Data: []byte("Hello, SSE!")}
+
+	// 读取响应
+	reader := bufio.NewReader(resp.Body)
+	var lines []string
+	for i := 0; i < 3; i++ {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("读取响应失败: %v", err)
+		}
+		lines = append(lines, line)
 	}
-	server.Broadcast <- testMessage
-
-	// 给予更长的等待时间
-	time.Sleep(500 * time.Millisecond)
-
-	// 检查响应
-	response := rr.Body.String()
+	response := strings.Join(lines, "")
 	expected := "event:test\ndata:Hello, SSE!\n\n"
-	if !strings.Contains(response, expected) {
-		t.Errorf("没有收到预期的 SSE 消息。得到的响应：%s", response)
+	if response != expected {
+		t.Errorf("没有收到预期的 SSE 消息。得到: %q, 想要: %q", response, expected)
 	}
 }
 
@@ -59,50 +85,55 @@ func TestBroadcast(t *testing.T) {
 	server := NewServer()
 	server.Debug = true
 
-	// 模拟客户端连接
-	req, _ := http.NewRequest("GET", "/subscribe/", nil)
-	rr := httptest.NewRecorder()
-	go server.ServeHTTP(rr, req)
+	ts := httptest.NewServer(http.HandlerFunc(server.ServeHTTP))
+	defer ts.Close()
+	defer server.Stop()
 
-	// 给予时间让连接建立
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"/subscribe/", nil)
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
 	time.Sleep(100 * time.Millisecond)
 
-	// 验证活跃连接数
 	if count := server.GetActiveConnectionCount(); count != 1 {
 		t.Errorf("预期的活跃连接数为 1，但得到 %d", count)
 	}
 
-	// 发送消息
-	testMessage := SSEMessage{Event: "test", Data: []byte("Hello, SSE!")}
-	server.Broadcast <- testMessage
+	server.Broadcast <- SSEMessage{Event: "test", Data: []byte("Hello, SSE!")}
 
-	// 给予更长的时间让消息被处理
-	time.Sleep(500 * time.Millisecond)
-
-	// 验证消息是否被发送
-	response := rr.Body.String()
+	reader := bufio.NewReader(resp.Body)
+	var lines []string
+	for i := 0; i < 3; i++ {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("读取响应失败: %v", err)
+		}
+		lines = append(lines, line)
+	}
+	response := strings.Join(lines, "")
 	expected := "event:test\ndata:Hello, SSE!\n\n"
-	if !strings.Contains(response, expected) {
-		t.Errorf("没有收到预期的 SSE 消息。得到的响应：%s", response)
+	if response != expected {
+		t.Errorf("没有收到预期的 SSE 消息。得到: %q, 想要: %q", response, expected)
 	}
 }
 
 func TestStopServer(t *testing.T) {
 	server := NewServer()
 
-	// 启动服务器
 	go server.Serve(":8080")
-
-	// 等待服务器启动
 	time.Sleep(100 * time.Millisecond)
 
-	// 停止服务器
 	server.hub.Stop()
 
-	// 检查 stopChan 是否被关闭
 	select {
 	case <-server.hub.stopChan:
-		// 正确：stopChan 被关闭
 	default:
 		t.Error("服务器的 stopChan 未被关闭")
 	}
@@ -111,25 +142,47 @@ func TestStopServer(t *testing.T) {
 func TestBroadcastAfterReconnect(t *testing.T) {
 	server := NewServer()
 
+	ts := httptest.NewServer(http.HandlerFunc(server.ServeHTTP))
+	defer ts.Close()
+	defer server.Stop()
+
 	// 第一个连接，随后主动断开
 	ctx1, cancel1 := context.WithCancel(context.Background())
-	req1, _ := http.NewRequestWithContext(ctx1, "GET", "/subscribe/", nil)
-	rr1 := httptest.NewRecorder()
-	go server.ServeHTTP(rr1, req1)
+	req1, _ := http.NewRequestWithContext(ctx1, "GET", ts.URL+"/subscribe/", nil)
+	client := &http.Client{}
+	resp1, err := client.Do(req1)
+	if err != nil {
+		t.Fatal(err)
+	}
 	time.Sleep(100 * time.Millisecond)
 	cancel1()
+	resp1.Body.Close()
 	time.Sleep(150 * time.Millisecond)
 
-	// 第二个连接建立后，广播应仍可正常工作
-	req2, _ := http.NewRequest("GET", "/subscribe/", nil)
-	rr2 := httptest.NewRecorder()
-	go server.ServeHTTP(rr2, req2)
+	// 第二个连接
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	req2, _ := http.NewRequestWithContext(ctx2, "GET", ts.URL+"/subscribe/", nil)
+	resp2, err := client.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
 	time.Sleep(100 * time.Millisecond)
 
 	server.Broadcast <- SSEMessage{Event: "reconnect", Data: []byte("ok")}
-	time.Sleep(300 * time.Millisecond)
 
-	if got := rr2.Body.String(); !strings.Contains(got, "event:reconnect\ndata:ok\n\n") {
+	reader := bufio.NewReader(resp2.Body)
+	var lines []string
+	for i := 0; i < 3; i++ {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("读取响应失败: %v", err)
+		}
+		lines = append(lines, line)
+	}
+	got := strings.Join(lines, "")
+	if !strings.Contains(got, "event:reconnect\ndata:ok\n\n") {
 		t.Fatalf("重连后广播失效，响应: %s", got)
 	}
 }

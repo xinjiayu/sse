@@ -32,7 +32,7 @@ func main() {
 func getEnv() (data []byte) {
 	var gm runtime.MemStats
 	runtime.ReadMemStats(&gm)
-	var tmpData = make(map[string]interface{})
+	var tmpData = make(map[string]any)
 	tmpData["goVersion"] = runtime.Version()
 	tmpData["goroutine"] = runtime.NumGoroutine()
 	//log.Println("GO运行信息", tmpData)

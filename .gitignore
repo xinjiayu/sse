@@ -29,3 +29,4 @@ plugins/built/
 hack/config.yaml
 go.sum
 gf
+.claude

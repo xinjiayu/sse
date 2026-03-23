@@ -27,22 +27,22 @@ func TestNewHub(t *testing.T) {
 
 func TestHubStart(t *testing.T) {
 	h := newHub()
-	startCalled := false
-	stopCalled := false
+	var startCalled int32
+	var stopCalled int32
 
-	start := func() { startCalled = true }
-	stop := func() { stopCalled = true }
+	start := func() { atomic.StoreInt32(&startCalled, 1) }
+	stop := func() { atomic.StoreInt32(&stopCalled, 1) }
 
 	h.Start(start, stop, true)
 
 	// 注册一个连接
-	conn := &connection{send: make(chan []byte, 1)}
+	conn := h.newConnection()
 	h.register <- conn
 
 	// 等待处理
 	time.Sleep(100 * time.Millisecond)
 
-	if !startCalled {
+	if atomic.LoadInt32(&startCalled) != 1 {
 		t.Error("start 函数未被调用")
 	}
 
@@ -56,7 +56,7 @@ func TestHubStart(t *testing.T) {
 	// 等待处理
 	time.Sleep(100 * time.Millisecond)
 
-	if !stopCalled {
+	if atomic.LoadInt32(&stopCalled) != 1 {
 		t.Error("stop 函数未被调用")
 	}
 
@@ -69,10 +69,7 @@ func TestHubBroadcast(t *testing.T) {
 	h := newHub()
 	h.Start(func() {}, func() {}, true)
 
-	conn := &connection{
-		send: make(chan []byte, 1),
-		hub:  h, // 确保设置 hub 字段
-	}
+	conn := h.newConnection()
 	h.register <- conn
 
 	// 等待连接注册

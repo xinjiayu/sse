@@ -27,11 +27,22 @@ type Server struct {
 	// 内部状态管理
 	broadcastRunning bool       // 标记广播协程是否正在运行
 	broadcastMu      sync.Mutex // 保护 broadcastRunning 的并发访问
+
+	// 心跳
+	heartbeatData []byte // 预序列化的心跳数据
+
+	// Per-IP 连接限制
+	ipConns   map[string]int32
+	ipConnsMu sync.Mutex
 }
 
 type ServerOptions struct {
 	DisableAdminEndpoints bool
 	CorsOptions           *CorsOptions
+	HeartbeatInterval     time.Duration // 心跳间隔，0 = 禁用（默认）
+	MaxConnectionsPerIP   int           // 单 IP 最大连接数，0 = 不限制（默认）
+	BroadcastWorkers      int           // 广播 worker 数量，0 = 默认 4
+	ShutdownTimeout       time.Duration // 优雅关闭超时，0 = 默认 5s
 }
 
 type CorsOptions struct {
@@ -54,6 +65,16 @@ func NewServer(options ...ServerOptions) *Server {
 		Receive:  make(chan SSEMessage, 1024),
 		Debug:    false,
 		Options:  opts,
+	}
+
+	if opts.BroadcastWorkers > 0 {
+		s.hub.broadcastWorkers = opts.BroadcastWorkers
+	}
+	if opts.HeartbeatInterval > 0 {
+		s.heartbeatData = []byte(":keepalive\n\n")
+	}
+	if opts.MaxConnectionsPerIP > 0 {
+		s.ipConns = make(map[string]int32)
 	}
 
 	s.hub.Start(s.startBroadcast, s.stopBroadcast, s.Debug)
@@ -119,9 +140,28 @@ func (s *Server) setCustomCORSHeaders(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) connectionHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.Debug {
-			log.Printf("New SSE connection established from %s", r.RemoteAddr)
-			defer log.Printf("SSE connection closed for %s", r.RemoteAddr)
+		s.logDebug("New SSE connection established from %s", r.RemoteAddr)
+		defer s.logDebug("SSE connection closed for %s", r.RemoteAddr)
+
+		// Per-IP 连接限制
+		if s.ipConns != nil {
+			ip := extractIP(r.RemoteAddr)
+			s.ipConnsMu.Lock()
+			if s.ipConns[ip] >= int32(s.Options.MaxConnectionsPerIP) {
+				s.ipConnsMu.Unlock()
+				http.Error(w, "Too many connections", http.StatusTooManyRequests)
+				return
+			}
+			s.ipConns[ip]++
+			s.ipConnsMu.Unlock()
+			defer func() {
+				s.ipConnsMu.Lock()
+				s.ipConns[ip]--
+				if s.ipConns[ip] <= 0 {
+					delete(s.ipConns, ip)
+				}
+				s.ipConnsMu.Unlock()
+			}()
 		}
 
 		// 设置 headers
@@ -133,7 +173,7 @@ func (s *Server) connectionHandler() http.Handler {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		flusher.Flush() // 立即发送 headers，避免客户端等待首条消息才收到响应头
 
 		// 创建并注册新连接
 		conn := s.hub.newConnection()
@@ -141,12 +181,18 @@ func (s *Server) connectionHandler() http.Handler {
 		s.hub.register <- conn
 		defer func() {
 			s.hub.unregister <- conn
-			if s.Debug {
-				log.Printf("Connection closed for %s", r.RemoteAddr)
-			}
+			s.logDebug("Connection closed for %s", r.RemoteAddr)
 		}()
 
 		ctx := r.Context()
+
+		// 心跳 ticker（nil channel 在 select 中永远不触发，零开销）
+		var heartbeatC <-chan time.Time
+		if s.Options.HeartbeatInterval > 0 {
+			hbTicker := time.NewTicker(s.Options.HeartbeatInterval)
+			defer hbTicker.Stop()
+			heartbeatC = hbTicker.C
+		}
 
 		// 主循环
 		for {
@@ -177,6 +223,17 @@ func (s *Server) connectionHandler() http.Handler {
 
 				// 使用安全的方式调用 Flush，捕获可能的 panic
 				s.safeFlush(flusher)
+			case <-heartbeatC:
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				if _, err := w.Write(s.heartbeatData); err != nil {
+					return
+				}
+				s.safeFlush(flusher)
+				conn.updateActivity()
 			case <-ctx.Done():
 				return
 			}
@@ -211,10 +268,20 @@ func (s *Server) Serve(addr string) error {
 func (s *Server) Stop() error {
 	s.closeOnce.Do(func() {
 		close(s.stopChan)
+		close(s.Receive)
+		// 排空 Receive 中残留的消息，防止写入方阻塞
+		go func() {
+			for range s.Receive {
+			}
+		}()
 	})
 	s.hub.Stop()
+	timeout := 5 * time.Second
+	if s.Options.ShutdownTimeout > 0 {
+		timeout = s.Options.ShutdownTimeout
+	}
 	if s.server != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 		return s.server.Shutdown(ctx)
 	}
@@ -308,8 +375,20 @@ func (s *Server) cleanupInactiveConnections() {
 	// 清理逻辑已统一由 hub.cleanupExpiredConnections() 处理
 }
 
-func (s *Server) logError(format string, v ...interface{}) {
+func (s *Server) logError(format string, v ...any) {
+	log.Printf(format, v...)
+}
+
+func (s *Server) logDebug(format string, v ...any) {
 	if s.Debug {
 		log.Printf(format, v...)
 	}
+}
+
+// extractIP 从 RemoteAddr 中提取 IP 地址（去除端口）
+func extractIP(remoteAddr string) string {
+	if idx := strings.LastIndex(remoteAddr, ":"); idx != -1 {
+		return remoteAddr[:idx]
+	}
+	return remoteAddr
 }
