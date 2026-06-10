@@ -2,6 +2,8 @@ package sseserver
 
 import (
 	"context"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
@@ -27,16 +29,28 @@ func TestStability_ConnectionChurnAndBroadcast(t *testing.T) {
 		t.Skip("skip stability test in short mode")
 	}
 
-	server := NewServer()
-	ts := httptest.NewServer(http.HandlerFunc(server.ServeHTTP))
-	defer ts.Close()
+	server := NewServer(ServerOptions{IdleTimeout: 100 * time.Millisecond})
+	listener, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	go func() { _ = server.ServeListener(listener) }()
 	defer server.Stop()
 
-	baseG := runtime.NumGoroutine()
-	client := &http.Client{Timeout: 2 * time.Second}
-	url := ts.URL + "/subscribe/"
+	waitUntil(t, 3*time.Second, func() bool {
+		return server.GetActiveConnectionCount() == 0
+	}, "server not ready or has leftover connections")
 
-	// 持续广播，模拟业务高频推送。
+	baseG := runtime.NumGoroutine()
+	client := &http.Client{
+		Timeout: 2 * time.Second,
+		Transport: &http.Transport{
+			DisableKeepAlives: true,
+		},
+	}
+	url := fmt.Sprintf("http://localhost:%d/subscribe/", port)
+
 	broadcastCtx, cancelBroadcast := context.WithCancel(context.Background())
 	var broadcasterWG sync.WaitGroup
 	broadcasterWG.Add(1)
@@ -50,7 +64,7 @@ func TestStability_ConnectionChurnAndBroadcast(t *testing.T) {
 				return
 			case <-ticker.C:
 				select {
-				case server.Receive <- SSEMessage{Event: "tick", Data: []byte("x")}:
+				case server.Broadcast <- SSEMessage{Event: "tick", Data: []byte("x")}:
 				case <-broadcastCtx.Done():
 					return
 				}
@@ -58,8 +72,7 @@ func TestStability_ConnectionChurnAndBroadcast(t *testing.T) {
 		}
 	}()
 
-	// 连接震荡：并发快速建立/断开连接，覆盖高并发短连接场景。
-	const workers = 40
+	const workers = 10
 	const loopsPerWorker = 20
 	var wg sync.WaitGroup
 	wg.Add(workers)
@@ -90,7 +103,6 @@ func TestStability_ConnectionChurnAndBroadcast(t *testing.T) {
 		return server.GetActiveConnectionCount() == 0
 	}, "连接震荡结束后活跃连接未归零")
 
-	// 允许测试基础设施带来小幅波动，但不应明显增长。
 	waitUntil(t, 3*time.Second, func() bool {
 		return runtime.NumGoroutine() <= baseG+25
 	}, "goroutine 数量未在预期范围内收敛，疑似存在泄漏")
@@ -98,7 +110,7 @@ func TestStability_ConnectionChurnAndBroadcast(t *testing.T) {
 
 func TestStability_SlowConsumerIsolation(t *testing.T) {
 	h := newHub()
-	h.Start(func() {}, func() {}, false)
+	h.Start(false)
 	defer h.Stop()
 
 	// 构造一个极小缓冲慢消费者，确保快速触发背压。

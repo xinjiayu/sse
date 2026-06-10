@@ -39,11 +39,11 @@ func TestConnectionWrite(t *testing.T) {
 	h := newHub()
 	conn := h.newConnection()
 
-	// 写入消息
 	message := []byte("test message")
-	conn.write(message)
+	if !conn.trySend(message) {
+		t.Error("trySend returned false for an open connection")
+	}
 
-	// 检查消息是否被写入
 	select {
 	case receivedMsg := <-conn.send:
 		if string(receivedMsg) != string(message) {
@@ -51,6 +51,11 @@ func TestConnectionWrite(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Error("写入消息超时")
+	}
+
+	conn.safeClose()
+	if conn.trySend(message) {
+		t.Error("trySend should return false after connection is closed")
 	}
 }
 

@@ -122,7 +122,7 @@ func TestSoak_LongRun(t *testing.T) {
 			case now := <-ticker.C:
 				payload := []byte(fmt.Sprintf(`{"ts":%d}`, now.UnixNano()))
 				select {
-				case server.Receive <- SSEMessage{Event: "soak", Data: payload}:
+				case server.Broadcast <- SSEMessage{Event: "soak", Data: payload}:
 					atomic.AddUint64(&sent, 1)
 				case <-runCtx.Done():
 					return

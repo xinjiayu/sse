@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -11,11 +12,8 @@ import (
 	"time"
 )
 
-const inactivityTimeout = 10 * time.Minute
-
 type Server struct {
 	Broadcast chan<- SSEMessage
-	Receive   chan SSEMessage
 	Options   ServerOptions
 	hub       *hub
 	mux       *http.ServeMux
@@ -24,14 +22,8 @@ type Server struct {
 	closeOnce sync.Once
 	server    *http.Server
 
-	// 内部状态管理
-	broadcastRunning bool       // 标记广播协程是否正在运行
-	broadcastMu      sync.Mutex // 保护 broadcastRunning 的并发访问
+	heartbeatData []byte
 
-	// 心跳
-	heartbeatData []byte // 预序列化的心跳数据
-
-	// Per-IP 连接限制
 	ipConns   map[string]int32
 	ipConnsMu sync.Mutex
 }
@@ -43,6 +35,7 @@ type ServerOptions struct {
 	MaxConnectionsPerIP   int           // 单 IP 最大连接数，0 = 不限制（默认）
 	BroadcastWorkers      int           // 广播 worker 数量，0 = 默认 4
 	ShutdownTimeout       time.Duration // 优雅关闭超时，0 = 默认 5s
+	IdleTimeout           time.Duration // 空闲连接超时，0 = 默认 30s
 }
 
 type CorsOptions struct {
@@ -62,7 +55,6 @@ func NewServer(options ...ServerOptions) *Server {
 		hub:      newHub(),
 		mux:      http.NewServeMux(),
 		stopChan: make(chan struct{}),
-		Receive:  make(chan SSEMessage, 1024),
 		Debug:    false,
 		Options:  opts,
 	}
@@ -77,7 +69,7 @@ func NewServer(options ...ServerOptions) *Server {
 		s.ipConns = make(map[string]int32)
 	}
 
-	s.hub.Start(s.startBroadcast, s.stopBroadcast, s.Debug)
+	s.hub.Start(s.Debug)
 	s.Broadcast = s.hub.broadcast
 	s.setupRoutes()
 	return s
@@ -178,15 +170,30 @@ func (s *Server) connectionHandler() http.Handler {
 		// 创建并注册新连接
 		conn := s.hub.newConnection()
 		sendCh := conn.send
-		s.hub.register <- conn
+
+		select {
+		case s.hub.register <- conn:
+		default:
+			go func() {
+				select {
+				case s.hub.register <- conn:
+				case <-s.stopChan:
+					conn.safeClose()
+					s.hub.putConnection(conn)
+				}
+			}()
+		}
 		defer func() {
-			s.hub.unregister <- conn
+			select {
+			case s.hub.unregister <- conn:
+			default:
+				s.hub.unregisterConnection(conn)
+			}
 			s.logDebug("Connection closed for %s", r.RemoteAddr)
 		}()
 
 		ctx := r.Context()
 
-		// 心跳 ticker（nil channel 在 select 中永远不触发，零开销）
 		var heartbeatC <-chan time.Time
 		if s.Options.HeartbeatInterval > 0 {
 			hbTicker := time.NewTicker(s.Options.HeartbeatInterval)
@@ -194,34 +201,37 @@ func (s *Server) connectionHandler() http.Handler {
 			heartbeatC = hbTicker.C
 		}
 
-		// 主循环
+		idleTimeout := 30 * time.Second
+		if s.Options.IdleTimeout > 0 {
+			idleTimeout = s.Options.IdleTimeout
+		}
+		idleTicker := time.NewTicker(idleTimeout)
+		defer idleTicker.Stop()
+
 		for {
 			select {
 			case msg, ok := <-sendCh:
 				if !ok {
 					return
 				}
-				// 在写入前先检查连接是否已断开
 				select {
 				case <-ctx.Done():
 					return
 				default:
 				}
 
-				conn.updateActivity() // 更新最后活动时间
+				conn.updateActivity()
 				if _, err := w.Write(msg); err != nil {
 					s.logError("Error writing to client: %v", err)
 					return
 				}
 
-				// 在 Flush 前再次检查连接状态，避免向已关闭的连接 Flush 导致段错误
 				select {
 				case <-ctx.Done():
 					return
 				default:
 				}
 
-				// 使用安全的方式调用 Flush，捕获可能的 panic
 				s.safeFlush(flusher)
 			case <-heartbeatC:
 				select {
@@ -234,6 +244,11 @@ func (s *Server) connectionHandler() http.Handler {
 				}
 				s.safeFlush(flusher)
 				conn.updateActivity()
+			case <-idleTicker.C:
+				if _, err := w.Write([]byte(":\n\n")); err != nil {
+					return
+				}
+				s.safeFlush(flusher)
 			case <-ctx.Done():
 				return
 			}
@@ -265,15 +280,18 @@ func (s *Server) Serve(addr string) error {
 	return s.server.ListenAndServe()
 }
 
+func (s *Server) ServeListener(listener net.Listener) error {
+	log.Println("Starting server on " + listener.Addr().String())
+	handler := s.proxyRemoteAddrHandler(s.requestLogger(http.HandlerFunc(s.ServeHTTP)))
+	s.server = &http.Server{
+		Handler: handler,
+	}
+	return s.server.Serve(listener)
+}
+
 func (s *Server) Stop() error {
 	s.closeOnce.Do(func() {
 		close(s.stopChan)
-		close(s.Receive)
-		// 排空 Receive 中残留的消息，防止写入方阻塞
-		go func() {
-			for range s.Receive {
-			}
-		}()
 	})
 	s.hub.Stop()
 	timeout := 5 * time.Second
@@ -309,49 +327,12 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 	})
 }
 
-func (s *Server) startBroadcast() {
-	s.broadcastMu.Lock()
-	// 如果广播协程已经在运行，直接返回，避免重复启动导致协程泄漏
-	if s.broadcastRunning {
-		s.broadcastMu.Unlock()
-		return
-	}
-	s.broadcastRunning = true
-	s.broadcastMu.Unlock()
-
-	go func() {
-		defer func() {
-			s.broadcastMu.Lock()
-			s.broadcastRunning = false
-			s.broadcastMu.Unlock()
-		}()
-
-		for {
-			select {
-			case <-s.stopChan:
-				return
-			case message, ok := <-s.Receive:
-				if !ok {
-					return
-				}
-				// 非阻塞发送，避免 Broadcast channel 满时阻塞
-				select {
-				case s.Broadcast <- message:
-				case <-s.stopChan:
-					return
-				}
-			}
-		}
-	}()
-}
-
-func (s *Server) stopBroadcast() {
-	// 广播协程在无连接时无需停止，避免后续重连后广播链路失效。
-	// 真正停止统一由 Stop() 关闭 stopChan 并停止 hub。
-}
-
 func (s *Server) GetActiveConnectionCount() int32 {
 	return s.hub.GetActiveConnectionCount()
+}
+
+func (s *Server) GetDroppedMessageCount() int64 {
+	return s.hub.GetDroppedMessageCount()
 }
 
 func (s *Server) addHealthCheckEndpoint() {
@@ -360,19 +341,6 @@ func (s *Server) addHealthCheckEndpoint() {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, "Active connections: %d", count)
 	})
-}
-
-// startPeriodicCleanup 已废弃，清理逻辑统一由 hub 管理
-// 保留此方法是为了向下兼容，但不再执行任何操作
-func (s *Server) startPeriodicCleanup() {
-	// 清理逻辑已统一由 hub.startCleanupRoutine() 处理
-	// 此方法保留为空实现以保持向下兼容
-}
-
-// cleanupInactiveConnections 已废弃，清理逻辑统一由 hub 管理
-// 保留此方法是为了向下兼容
-func (s *Server) cleanupInactiveConnections() {
-	// 清理逻辑已统一由 hub.cleanupExpiredConnections() 处理
 }
 
 func (s *Server) logError(format string, v ...any) {
@@ -385,10 +353,10 @@ func (s *Server) logDebug(format string, v ...any) {
 	}
 }
 
-// extractIP 从 RemoteAddr 中提取 IP 地址（去除端口）
 func extractIP(remoteAddr string) string {
-	if idx := strings.LastIndex(remoteAddr, ":"); idx != -1 {
-		return remoteAddr[:idx]
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return remoteAddr
 	}
-	return remoteAddr
+	return host
 }
